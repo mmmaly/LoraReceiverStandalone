@@ -14,18 +14,29 @@ Based on the DSP algorithms from [gr-lora_sdr](https://github.com/tapparelj/gr-l
 
 ## Dependencies
 
-- `librtlsdr-dev` — RTL-SDR driver library
+- `librtlsdr` — RTL-SDR driver library
 - A C++17 compiler (g++ or clang++)
 - [KissFFT](https://github.com/mborgerding/kissfft) (included in source)
 
-On Debian/Ubuntu:
+### Linux (Debian/Ubuntu)
+
 ```bash
 sudo apt install librtlsdr-dev build-essential
 ```
 
+### macOS
+
+```bash
+brew install librtlsdr
+```
+
+Xcode command line tools provide the compiler (`xcode-select --install` if needed). The Makefile auto-detects macOS and adds the correct Homebrew paths for both Apple Silicon and Intel Macs.
+
 ## Build
 
 ```bash
+git clone https://github.com/mmmaly/LoraReceiverStandalone.git
+cd LoraReceiverStandalone
 make
 ```
 
