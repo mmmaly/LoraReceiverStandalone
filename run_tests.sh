@@ -35,6 +35,10 @@ run_case "SF12 BW62.5k LDRO"   "-S 12 -b 62500  -s 250000 -c 1 -m 'AHOJ SF12'"  
 # CFO robustness (300 Hz offset ~ a few bins at SF8/62.5k)
 run_case "SF8 with 300Hz CFO"  "-S 8 -b 62500 -s 250000 -c 1 -m 'CFO TEST' -O 300" "-S 8 -b 62500 -s 250000" "CFO TEST"
 
+# Large CFO: ~3.3 bins, integer part 3. Regression test for the sync check --
+# real RTL-SDR dongles routinely sit several bins off even after ppm correction
+run_case "SF8 with 800Hz CFO (3+ bins)" "-S 8 -b 62500 -s 250000 -c 1 -m 'BIG CFO TEST' -O 800" "-S 8 -b 62500 -s 250000" "BIG CFO TEST"
+
 # Noise robustness
 run_case "SF8 noisy (sigma 0.15)" "-S 8 -b 62500 -s 250000 -c 1 -m 'NOISY TEST' -N 0.15" "-S 8 -b 62500 -s 250000" "NOISY TEST"
 
