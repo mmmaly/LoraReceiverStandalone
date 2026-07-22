@@ -11,6 +11,7 @@ Connects directly to an RTL-SDR dongle (or replays a recorded IQ file) and imple
 - Explicit header parsing with checksum verification
 - LFSR dewhitening and CRC-16 CCITT verification
 - Parallel auto-scan mode: all SF/BW combinations decoded simultaneously
+- Multi-channel: one dongle receives several LoRa channels at once (`-C f1,f2,...`)
 
 Based on the DSP algorithms from [gr-lora_sdr](https://github.com/tapparelj/gr-lora_sdr) (EPFL/TCL), reimplemented as a single self-contained application.
 
@@ -51,10 +52,11 @@ make check      # builds the offline frame generator and runs end-to-end tests (
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-f <hz>` | Center frequency | 869618000 |
-| `-s <hz>` | Sample rate | 250000 |
-| `-b <hz>` | LoRa bandwidth | 62500 |
-| `-S <5-12>` | Spreading factor | 8 |
+| `-f <hz>` | Tuner center frequency | 869618000 |
+| `-C <hz,hz,..>` | Channel frequencies (multi-channel mode; tuner auto-centers between them) | `-f` value |
+| `-s <hz>` | Sample rate | 250000 (1000000 with multi `-C`) |
+| `-b <hz,hz,..>` | LoRa bandwidth(s) | 62500 |
+| `-S <5-12,..>` | Spreading factor(s) | 8 |
 | `-c <1-4>` | Coding rate (1=4/5 .. 4=4/8); explicit header overrides | 4 |
 | `-w <hex>` | Sync word; `0` = accept any | 0x12 |
 | `-g <0.1dB>` | RTL-SDR tuner gain | 490 |
@@ -81,9 +83,16 @@ make check      # builds the offline frame generator and runs end-to-end tests (
 # Record while receiving, then replay later (no SDR needed for replay)
 ./lora_rx -D capture.iq
 ./lora_rx -r capture.iq -A
+
+# One dongle, two meshes: Czech (869.432 MHz, SF7) and Slovak (869.618 MHz, SF8)
+# received simultaneously. The tuner auto-centers between the channels at 1 MS/s,
+# which also puts the RTL-SDR DC spike harmlessly between them.
+./lora_rx -C 869432000,869618000 -S 7,8
 ```
 
-In auto-scan mode `-S` and `-b` act as filters: `-A -S 9` scans only bandwidths at SF9; `-A -b 125000` scans only SFs at 125 kHz.
+`-S` and `-b` accept comma-separated lists; each channel gets a decoder for every SF x BW combination. In auto-scan mode they act as filters: `-A -S 9` scans only bandwidths at SF9; `-A -b 125000` scans only SFs at 125 kHz. `-A` combines with `-C` (all SF/BW on every channel).
+
+When more than one decoder runs, each packet on stdout is preceded by a `rx cfg: freq=... sf=... bw=...` line identifying which channel/decoder produced it (the `rx msg` / `rx str` / CRC line format itself is unchanged).
 
 ### Output
 
