@@ -347,21 +347,25 @@ public:
                     else
                         m_cfo_int = (int)floor((double)(down_val - (int)N) / 2.0);
 
-                    // Net IDs corrected for integer CFO -> recovered sync word
+                    // Net ID bins already have integer CFO absorbed by the
+                    // k_hat timing alignment in DETECT - use them raw.
+                    // (Subtracting m_cfo_int here double-corrects and rejects
+                    // every frame with |CFO| > 2 bins.)
                     int nid[2];
                     for (int i = 0; i < 2; i++)
-                        nid[i] = (int)mod(net_ids[i] - m_cfo_int, N);
+                        nid[i] = (int)mod(net_ids[i], N);
                     uint8_t det_sync = (uint8_t)(((((nid[0] + 4) >> 3) & 0xF) << 4) |
                                                  (((nid[1] + 4) >> 3) & 0xF));
 
-                    // Validate sync word (both symbols) unless accept-any (-w 0)
+                    // Validate sync word unless accept-any (-w 0). Only the
+                    // first net-ID symbol is checked: real frames sometimes
+                    // mis-latch the second one yet still decode fine, and the
+                    // header checksum + CRC reject false syncs anyway.
                     bool sync_ok = true;
                     if (cfg.sync_words[0] != 0 || cfg.sync_words[1] != 0) {
-                        for (int i = 0; i < 2; i++) {
-                            long d = std::min(mod(nid[i] - cfg.sync_words[i], N),
-                                              mod(cfg.sync_words[i] - nid[i], N));
-                            if (d > 2) sync_ok = false;
-                        }
+                        long d = std::min(mod(nid[0] - cfg.sync_words[0], N),
+                                          mod(cfg.sync_words[0] - nid[0], N));
+                        if (d > 2) sync_ok = false;
                     }
                     if (!sync_ok) {
                         reset_state();
