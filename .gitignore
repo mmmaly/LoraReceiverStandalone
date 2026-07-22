@@ -1,2 +1,4 @@
 *.o
 lora_rx
+lora_tx_gen
+*.iq
