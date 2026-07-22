@@ -18,7 +18,7 @@ run_case() {
     local out
     out=$(eval "./lora_rx -r '$TMP/t.iq' $rxargs" 2>/dev/null || true)
     local expect_hex
-    expect_hex=$(printf '%s' "$expect" | xxd -p | tr -d '\n')
+    expect_hex=$(printf '%s' "$expect" | od -An -tx1 | tr -d ' \n')
     if echo "$out" | grep -q "CRC valid" && echo "$out" | grep -qF "rx str: $expect" \
        && echo "$out" | grep -qF "rx ok: $expect_hex"; then
         echo "PASS: $desc"
