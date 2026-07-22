@@ -1,7 +1,7 @@
 CXX      ?= g++
 CC       ?= gcc
-CXXFLAGS  = -O2 -Wall -Wextra -std=c++17
-CFLAGS    = -O2 -Wall
+CXXFLAGS  = -O3 -fno-math-errno -Wall -Wextra -std=c++17
+CFLAGS    = -O3 -fno-math-errno -Wall
 LDFLAGS   = -lrtlsdr -lpthread -lm
 
 # macOS: Homebrew installs to /opt/homebrew (Apple Silicon) or /usr/local (Intel)
@@ -14,6 +14,7 @@ ifeq ($(UNAME_S),Darwin)
 endif
 
 TARGET = lora_rx
+TXGEN  = lora_tx_gen
 
 SRCS_CXX = lora_rx.cpp
 SRCS_C   = kiss_fft.c
@@ -24,13 +25,21 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
+$(TXGEN): lora_tx_gen.cpp lora_common.h
+	$(CXX) $(CXXFLAGS) -o $@ lora_tx_gen.cpp -lm
+
+lora_rx.o: lora_rx.cpp lora_common.h
+
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-clean:
-	rm -f $(OBJS) $(TARGET)
+check: $(TARGET) $(TXGEN)
+	./run_tests.sh
 
-.PHONY: all clean
+clean:
+	rm -f $(OBJS) $(TARGET) $(TXGEN)
+
+.PHONY: all clean check
