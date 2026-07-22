@@ -158,10 +158,18 @@ int main(int argc, char *argv[]) {
     };
 
     std::vector<uint8_t> out(sig.size() * 2);
+    // Incremental oscillator with double phase: float phase accumulation would
+    // lose precision after ~1e6 samples at large offsets
+    double ph = 0.0;
+    const double ph_inc = 2.0 * M_PI * (double)cfo_hz / (double)samp_rate;
     for (size_t n = 0; n < sig.size(); n++) {
         cx z = sig[n] * amp;
-        if (cfo_hz != 0)
-            z *= expj(2.0f * (float)M_PI * cfo_hz / (float)samp_rate * (float)n);
+        if (cfo_hz != 0) {
+            z *= cx((float)cos(ph), (float)sin(ph));
+            ph += ph_inc;
+            if (ph > M_PI) ph -= 2.0 * M_PI;
+            else if (ph < -M_PI) ph += 2.0 * M_PI;
+        }
         float re = z.real() + noise * (frand() + frand() + frand()) * 2.0f;
         float im = z.imag() + noise * (frand() + frand() + frand()) * 2.0f;
         int r8 = (int)lrintf(127.5f + 127.5f * re);
