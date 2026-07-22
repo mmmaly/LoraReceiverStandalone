@@ -1,12 +1,15 @@
 // Standalone LoRa receiver - pure C/C++ reimplementation of the gr-lora_sdr
 // demodulation chain. No GNU Radio dependency.
 //
-// Pipeline: RTL-SDR IQ -> Frame Sync -> FFT Demod -> Gray Demap ->
-//           Deinterleave -> Hamming Decode -> Header Decode ->
-//           Dewhiten -> CRC Verify -> Output
+// Pipeline: RTL-SDR IQ (or IQ file) -> Anti-alias FIR + decimate ->
+//           Frame Sync -> FFT Demod -> Gray Demap -> Deinterleave ->
+//           Hamming Decode -> Header Decode -> Dewhiten -> CRC Verify -> Output
+//
+// Multiple demodulators (one per SF/BW combination) can run in parallel on
+// the same sample stream (-A auto-scan mode), each on its own worker thread.
 //
 // Build:
-//   g++ -O2 -o lora_rx lora_rx.cpp kiss_fft.c -lrtlsdr -lpthread -lm
+//   make
 //
 // Usage:
 //   ./lora_rx [options]
@@ -14,12 +17,15 @@
 //     -s <samp_rate>    Sample rate (default 250000)
 //     -b <bandwidth>    LoRa bandwidth (default 62500)
 //     -S <sf>           Spreading factor 5-12 (default 8)
-//     -c <cr>           Coding rate 1-4 (default 4)
-//     -w <sync_word>    Sync word hex (default 0x12)
+//     -c <cr>           Coding rate 1-4 (default 4; explicit header overrides)
+//     -w <sync_word>    Sync word hex (default 0x12, 0 = accept any)
 //     -g <gain>         RTL-SDR gain in 0.1 dB (default 490)
 //     -p <ppm>          Frequency correction ppm (default -3)
 //     -I                Implicit header mode
 //     -L <pay_len>      Payload length for implicit header (default 11)
+//     -A                Auto-scan: run all SF (7-12) and BW combinations in parallel
+//     -r <file>         Read IQ from file (rtl_sdr u8 format, "-" = stdin) instead of SDR
+//     -D <file>         Dump raw IQ to file while receiving (for later replay with -r)
 
 #include <cstdio>
 #include <cstdlib>
@@ -28,8 +34,13 @@
 #include <csignal>
 #include <complex>
 #include <vector>
+#include <array>
+#include <deque>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <algorithm>
-#include <numeric>
 #include <unordered_map>
 #include <string>
 #include <getopt.h>
@@ -39,11 +50,11 @@ extern "C" {
 #include "kiss_fft.h"
 }
 
+#include "lora_common.h"
+
 // ============================================================================
 // Types and constants
 // ============================================================================
-
-using cx = std::complex<float>;
 
 static constexpr int MIN_SF = 5;
 static constexpr int MAX_SF = 12;
@@ -51,46 +62,19 @@ static constexpr float LDRO_MAX_DURATION_MS = 16.0f;
 
 static volatile bool g_running = true;
 static rtlsdr_dev_t *g_dev = nullptr;
+static std::mutex g_print_mtx;
 
 static void signal_handler(int) {
     g_running = false;
     if (g_dev) rtlsdr_cancel_async(g_dev);
 }
 
-// ============================================================================
-// Whitening sequence (LFSR)
-// ============================================================================
-
-static const uint8_t whitening_seq[] = {
-    0xFF, 0xFE, 0xFC, 0xF8, 0xF0, 0xE1, 0xC2, 0x85, 0x0B, 0x17, 0x2F, 0x5E, 0xBC, 0x78, 0xF1, 0xE3,
-    0xC6, 0x8D, 0x1A, 0x34, 0x68, 0xD0, 0xA0, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x11, 0x23, 0x47,
-    0x8E, 0x1C, 0x38, 0x71, 0xE2, 0xC4, 0x89, 0x12, 0x25, 0x4B, 0x97, 0x2E, 0x5C, 0xB8, 0x70, 0xE0,
-    0xC0, 0x81, 0x03, 0x06, 0x0C, 0x19, 0x32, 0x64, 0xC9, 0x92, 0x24, 0x49, 0x93, 0x26, 0x4D, 0x9B,
-    0x37, 0x6E, 0xDC, 0xB9, 0x72, 0xE4, 0xC8, 0x90, 0x20, 0x41, 0x82, 0x05, 0x0A, 0x15, 0x2B, 0x56,
-    0xAD, 0x5B, 0xB6, 0x6D, 0xDA, 0xB5, 0x6B, 0xD6, 0xAC, 0x59, 0xB2, 0x65, 0xCB, 0x96, 0x2C, 0x58,
-    0xB0, 0x61, 0xC3, 0x87, 0x0F, 0x1F, 0x3E, 0x7D, 0xFB, 0xF6, 0xED, 0xDB, 0xB7, 0x6F, 0xDE, 0xBD,
-    0x7A, 0xF5, 0xEB, 0xD7, 0xAE, 0x5D, 0xBA, 0x74, 0xE8, 0xD1, 0xA2, 0x44, 0x88, 0x10, 0x21, 0x43,
-    0x86, 0x0D, 0x1B, 0x36, 0x6C, 0xD8, 0xB1, 0x63, 0xC7, 0x8F, 0x1E, 0x3C, 0x79, 0xF3, 0xE7, 0xCE,
-    0x9C, 0x39, 0x73, 0xE6, 0xCC, 0x98, 0x31, 0x62, 0xC5, 0x8B, 0x16, 0x2D, 0x5A, 0xB4, 0x69, 0xD2,
-    0xA4, 0x48, 0x91, 0x22, 0x45, 0x8A, 0x14, 0x29, 0x52, 0xA5, 0x4A, 0x95, 0x2A, 0x54, 0xA9, 0x53,
-    0xA7, 0x4E, 0x9D, 0x3B, 0x77, 0xEE, 0xDD, 0xBB, 0x76, 0xEC, 0xD9, 0xB3, 0x67, 0xCF, 0x9E, 0x3D,
-    0x7B, 0xF7, 0xEF, 0xDF, 0xBF, 0x7E, 0xFD, 0xFA, 0xF4, 0xE9, 0xD3, 0xA6, 0x4C, 0x99, 0x33, 0x66,
-    0xCD, 0x9A, 0x35, 0x6A, 0xD4, 0xA8, 0x51, 0xA3, 0x46, 0x8C, 0x18, 0x30, 0x60, 0xC1, 0x83, 0x07,
-    0x0E, 0x1D, 0x3A, 0x75, 0xEA, 0xD5, 0xAA, 0x55, 0xAB, 0x57, 0xAF, 0x5F, 0xBE, 0x7C, 0xF9, 0xF2,
-    0xE5, 0xCA, 0x94, 0x28, 0x50, 0xA1, 0x42, 0x84, 0x09, 0x13, 0x27, 0x4F, 0x9F, 0x3F, 0x7F
-};
+static_assert(sizeof(cx) == sizeof(kiss_fft_cpx),
+              "std::complex<float> must be layout-compatible with kiss_fft_cpx");
 
 // ============================================================================
 // Utility functions
 // ============================================================================
-
-static inline long mod(long a, long b) { return ((a % b) + b) % b; }
-
-static inline cx expj(float phase) { return cx(cosf(phase), sinf(phase)); }
-
-static inline int my_roundf(float x) {
-    return (int)(x > 0 ? (int)(x + 0.5f) : (int)ceilf(x - 0.5f));
-}
 
 static int most_frequent(const int *arr, int n) {
     std::unordered_map<int, int> hash;
@@ -101,64 +85,9 @@ static int most_frequent(const int *arr, int n) {
     return res;
 }
 
-// Build modulated upchirp
-static void build_upchirp(cx *chirp, uint32_t id, uint8_t sf, uint8_t os_factor = 1) {
-    double N = (1 << sf);
-    int n_fold = (int)(N * os_factor - id * os_factor);
-    for (int n = 0; n < (int)(N * os_factor); n++) {
-        double phase;
-        if (n < n_fold)
-            phase = 2.0 * M_PI * (n * n / (2.0 * N) / (os_factor * os_factor) + ((double)id / N - 0.5) * n / os_factor);
-        else
-            phase = 2.0 * M_PI * (n * n / (2.0 * N) / (os_factor * os_factor) + ((double)id / N - 1.5) * n / os_factor);
-        chirp[n] = cx((float)cos(phase), (float)sin(phase));
-    }
-}
-
-// Build reference up/down chirps
-static void build_ref_chirps(cx *upchirp, cx *downchirp, uint8_t sf, uint8_t os_factor = 1) {
-    int N = (1 << sf) * os_factor;
-    build_upchirp(upchirp, 0, sf, os_factor);
-    for (int i = 0; i < N; i++) downchirp[i] = std::conj(upchirp[i]);
-}
-
-// Complex multiply: out = a * b, element-wise
-static void cx_multiply(cx *out, const cx *a, const cx *b, int n) {
-    for (int i = 0; i < n; i++) out[i] = a[i] * b[i];
-}
-
-// FFT magnitude squared, returns argmax
-static uint32_t fft_argmax(const cx *samples, const cx *ref_chirp, int N,
-                           kiss_fft_cfg cfg, float *energy_out = nullptr) {
-    std::vector<cx> dechirped(N);
-    cx_multiply(dechirped.data(), samples, ref_chirp, N);
-
-    kiss_fft_cpx *cx_in  = new kiss_fft_cpx[N];
-    kiss_fft_cpx *cx_out = new kiss_fft_cpx[N];
-    for (int i = 0; i < N; i++) { cx_in[i].r = dechirped[i].real(); cx_in[i].i = dechirped[i].imag(); }
-    kiss_fft(cfg, cx_in, cx_out);
-
-    float max_val = -1;
-    uint32_t max_idx = 0;
-    float tot_en = 0;
-    for (int i = 0; i < N; i++) {
-        float mag = cx_out[i].r * cx_out[i].r + cx_out[i].i * cx_out[i].i;
-        tot_en += mag;
-        if (mag > max_val) { max_val = mag; max_idx = i; }
-    }
-    if (energy_out) *energy_out = tot_en;
-
-    delete[] cx_in;
-    delete[] cx_out;
-    return (tot_en > 0) ? max_idx : (uint32_t)-1;
-}
-
 // ============================================================================
 // Hamming Decoder (soft + hard)
 // ============================================================================
-
-static const uint8_t cw_LUT[16]     = {0, 23, 45, 58, 78, 89, 99, 116, 139, 156, 166, 177, 197, 210, 232, 255};
-static const uint8_t cw_LUT_cr5[16] = {0, 24, 40, 48, 72, 80, 96, 120, 136, 144, 160, 184, 192, 216, 232, 240};
 
 static uint8_t hamming_decode_soft(const double *codeword_LLR, int cr_app) {
     int cw_len = cr_app + 4;
@@ -218,25 +147,6 @@ static uint8_t hamming_decode_hard(uint8_t cw_byte, int cr_app) {
 }
 
 // ============================================================================
-// CRC-16 CCITT
-// ============================================================================
-
-static uint16_t crc16(const uint8_t *data, uint32_t len) {
-    uint16_t crc = 0x0000;
-    for (uint32_t i = 0; i < len; i++) {
-        uint8_t byte = data[i];
-        for (int b = 0; b < 8; b++) {
-            if (((crc & 0x8000) >> 8) ^ (byte & 0x80))
-                crc = (crc << 1) ^ 0x1021;
-            else
-                crc = (crc << 1);
-            byte <<= 1;
-        }
-    }
-    return crc;
-}
-
-// ============================================================================
 // LoRa Receiver Configuration
 // ============================================================================
 
@@ -246,7 +156,7 @@ struct LoRaConfig {
     uint32_t bw             = 62500;
     uint8_t  sf             = 8;
     uint8_t  cr             = 4;    // coding rate 1-4 (maps to 4/5 .. 4/8)
-    uint16_t sync_word      = 0x12;
+    uint16_t sync_word      = 0x12; // 0 = accept any
     bool     impl_head      = false;
     bool     has_crc        = true;
     uint32_t pay_len        = 11;
@@ -276,39 +186,6 @@ struct LoRaConfig {
 
 class LoRaDemodulator {
 public:
-    LoRaDemodulator(const LoRaConfig &cfg) : cfg(cfg) {
-        N = cfg.n_bins;
-        os = cfg.os_factor;
-        sps = cfg.samples_per_symbol;
-
-        upchirp.resize(N);
-        downchirp.resize(N);
-        build_ref_chirps(upchirp.data(), downchirp.data(), cfg.sf);
-
-        fft_cfg = kiss_fft_alloc(N, 0, nullptr, nullptr);
-
-        n_up_req = cfg.preamble_len - 3;
-        up_symb_to_use = n_up_req - 1;
-        preamb_up_vals.resize(n_up_req, 0);
-        preamble_raw.resize(n_up_req * N);
-        preamble_raw_up.resize((n_up_req + 3) * sps);
-        preamble_upchirps.resize(n_up_req * N);
-        net_id_samp.resize((int)(sps * 2.5));
-        additional_symbol_samp.resize(2 * sps);
-        in_down.resize(N);
-        symb_corr.resize(N);
-        CFO_frac_correc.resize(N);
-
-        reset_state();
-    }
-
-    ~LoRaDemodulator() {
-        kiss_fft_free(fft_cfg);
-    }
-
-    // Feed oversampled IQ samples. This processes one symbol-worth at a time.
-    // Returns true if a complete packet was decoded since last call.
-    // Decoded packets are in last_packets.
     struct Packet {
         std::vector<uint8_t> payload;
         bool crc_valid;
@@ -318,35 +195,103 @@ public:
 
     std::vector<Packet> last_packets;
 
-    void process_samples(const cx *samples, int n_samples) {
-        // Append to ring buffer
+    LoRaDemodulator(const LoRaConfig &cfg_, std::string tag_ = "")
+        : cfg(cfg_), tag(std::move(tag_)) {
+        N = cfg.n_bins;
+        os = cfg.os_factor;
+        sps = cfg.samples_per_symbol;
+
+        upchirp.resize(N);
+        downchirp.resize(N);
+        build_ref_chirps(upchirp.data(), downchirp.data(), cfg.sf);
+
+        fft_cfg  = kiss_fft_alloc(N, 0, nullptr, nullptr);
+        fft_cfg2 = kiss_fft_alloc(2 * N, 0, nullptr, nullptr);
+
+        // Preallocated FFT scratch (2N covers both the N-point and the
+        // zero-padded 2N-point transforms used by the STO estimator)
+        dechirp_buf.resize(2 * N);
+        fft_out.resize(2 * N);
+        fft_mag.resize(2 * N);
+
+        n_up_req = cfg.preamble_len - 3;
+        up_symb_to_use = n_up_req - 1;
+        preamb_up_vals.resize(n_up_req, 0);
+        preamble_raw.resize(n_up_req * N);
+        preamble_upchirps.resize(n_up_req * N);
+        cfo_fft_val.resize(up_symb_to_use * N);
+        in_down.resize(N);
+        symb_corr.resize(N);
+        CFO_frac_correc.resize(N);
+
+        // Gray demap LUTs: FFT bin -> data symbol, for payload and for
+        // header/LDRO (extra /4) modes
+        demap_pay.resize(N);
+        demap_hdr.resize(N);
+        for (uint32_t n = 0; n < N; n++) {
+            uint32_t v = (n + N - 1) % N;   // mod(n - 1, N)
+            demap_pay[n] = (uint16_t)(v ^ (v >> 1));
+            uint32_t h = v / 4;
+            demap_hdr[n] = (uint16_t)(h ^ (h >> 1));
+        }
+
+        // Anti-alias low-pass FIR applied before decimation (only needed when
+        // oversampled). Cutoff slightly above bw/2 so band edges pass intact.
+        if (os > 1) {
+            int T = 8 * os + 1;
+            fir_taps.resize(T);
+            fir_delay = T / 2;
+            double fc = 0.55 / os;  // as fraction of full sample rate
+            double sum = 0;
+            for (int k = 0; k < T; k++) {
+                double x = k - (T - 1) / 2.0;
+                double s = (x == 0) ? 2.0 * M_PI * fc : sin(2.0 * M_PI * fc * x) / x;
+                double w = 0.54 - 0.46 * cos(2.0 * M_PI * k / (T - 1));
+                fir_taps[k] = (float)(s * w);
+                sum += s * w;
+            }
+            for (auto &t : fir_taps) t = (float)(t / sum);
+        } else {
+            fir_delay = 0;
+        }
+
+        reset_state();
+    }
+
+    ~LoRaDemodulator() {
+        kiss_fft_free(fft_cfg);
+        kiss_fft_free(fft_cfg2);
+    }
+
+    // Feed oversampled IQ samples; processes one symbol-worth at a time.
+    void process_samples(const cx *samples, size_t n_samples) {
         ring.insert(ring.end(), samples, samples + n_samples);
 
-        while ((int)ring.size() >= (int)sps + 2 * os) {
-            // Downsample: pick one sample per os period, corrected for STO
+        const size_t need = sps + 2 * os + fir_delay;
+        while (avail() >= need) {
+            // Downsample through the anti-alias filter: one output sample per
+            // os period, corrected for fractional STO
             for (uint32_t ii = 0; ii < N; ii++) {
-                int idx = (int)(os / 2 + os * ii - my_roundf(m_sto_frac * os));
+                long idx = (long)(os / 2) + (long)os * ii - my_roundf(m_sto_frac * os);
                 if (idx < 0) idx = 0;
-                if (idx >= (int)ring.size()) { return; } // need more data
-                in_down[ii] = ring[idx];
+                if ((size_t)(idx + fir_delay) >= avail()) return; // need more data
+                in_down[ii] = sample_at(idx);
             }
 
-            int items_to_consume = sps;
+            long items_to_consume = sps;
 
             switch (state) {
             case DETECT: {
-                uint32_t bin_idx_new = fft_argmax(in_down.data(), downchirp.data(), N, fft_cfg);
+                uint32_t bin_idx_new = fft_argmax(in_down.data(), downchirp.data());
 
-                if (std::abs((long)mod(std::abs((long)bin_idx_new - bin_idx) + 1, N) - 1) <= 1 && bin_idx_new != (uint32_t)-1) {
+                if (std::abs((long)mod(std::abs((long)bin_idx_new - (long)bin_idx) + 1, N) - 1) <= 1 && bin_idx_new != (uint32_t)-1) {
                     if (symbol_cnt == 1 && bin_idx != (uint32_t)-1)
                         preamb_up_vals[0] = bin_idx;
                     preamb_up_vals[symbol_cnt] = bin_idx_new;
                     memcpy(&preamble_raw[N * symbol_cnt], in_down.data(), N * sizeof(cx));
-                    memcpy(&preamble_raw_up[sps * symbol_cnt], &ring[os / 2], sps * sizeof(cx));
                     symbol_cnt++;
                 } else {
                     memcpy(&preamble_raw[0], in_down.data(), N * sizeof(cx));
-                    memcpy(&preamble_raw_up[0], &ring[os / 2], sps * sizeof(cx));
                     symbol_cnt = 1;
                 }
                 bin_idx = bin_idx_new;
@@ -356,13 +301,8 @@ public:
                     state = SYNC;
                     symbol_cnt = 0;
                     cfo_frac_sto_frac_est = false;
-                    k_hat = most_frequent((const int *)preamb_up_vals.data(), preamb_up_vals.size());
-
-                    int copy_start = (int)(0.75 * sps - k_hat * os);
-                    if (copy_start >= 0 && copy_start + (int)(0.25 * sps) <= (int)ring.size())
-                        memcpy(net_id_samp.data(), &ring[copy_start], (int)(0.25 * sps) * sizeof(cx));
-
-                    items_to_consume = os * (N - k_hat);
+                    k_hat = most_frequent(preamb_up_vals.data(), (int)preamb_up_vals.size());
+                    items_to_consume = (long)os * ((long)N - k_hat);
                 }
                 break;
             }
@@ -378,7 +318,7 @@ public:
 
                 items_to_consume = sps;
                 cx_multiply(symb_corr.data(), in_down.data(), CFO_frac_correc.data(), N);
-                bin_idx = fft_argmax(symb_corr.data(), downchirp.data(), N, fft_cfg);
+                bin_idx = fft_argmax(symb_corr.data(), downchirp.data());
 
                 switch (symbol_cnt) {
                 case NET_ID1:
@@ -387,41 +327,42 @@ public:
                         if (additional_upchirps < 3) additional_upchirps++;
                     } else {
                         symbol_cnt = NET_ID2;
-                        net_ids[0] = bin_idx;
-                        if ((int)(0.25 * sps) + (int)sps <= (int)ring.size())
-                            memcpy(&net_id_samp[(int)(0.25 * sps)], ring.data(), sps * sizeof(cx));
+                        net_ids[0] = (int)bin_idx;
                     }
                     break;
                 case NET_ID2:
                     symbol_cnt = DOWNCHIRP1;
-                    net_ids[1] = bin_idx;
+                    net_ids[1] = (int)bin_idx;
                     break;
                 case DOWNCHIRP1:
                     symbol_cnt = DOWNCHIRP2;
                     break;
                 case DOWNCHIRP2:
-                    down_val = fft_argmax(symb_corr.data(), upchirp.data(), N, fft_cfg);
-                    memcpy(additional_symbol_samp.data(), ring.data(), sps * sizeof(cx));
+                    down_val = (int)fft_argmax(symb_corr.data(), upchirp.data());
                     symbol_cnt = QUARTER_DOWN;
                     break;
                 case QUARTER_DOWN: {
-                    if ((int)(sps + sps) <= (int)ring.size())
-                        memcpy(&additional_symbol_samp[sps], ring.data(), sps * sizeof(cx));
-
                     if ((uint32_t)down_val < N / 2)
                         m_cfo_int = (int)floor((double)down_val / 2.0);
                     else
                         m_cfo_int = (int)floor((double)(down_val - (int)N) / 2.0);
 
-                    // Validate sync word
+                    // Net IDs corrected for integer CFO -> recovered sync word
+                    int nid[2];
+                    for (int i = 0; i < 2; i++)
+                        nid[i] = (int)mod(net_ids[i] - m_cfo_int, N);
+                    uint8_t det_sync = (uint8_t)(((((nid[0] + 4) >> 3) & 0xF) << 4) |
+                                                 (((nid[1] + 4) >> 3) & 0xF));
+
+                    // Validate sync word (both symbols) unless accept-any (-w 0)
                     bool sync_ok = true;
-                    if (cfg.sync_words[0] != 0) {
-                        // We don't have perfectly corrected net_ids here - use a tolerance check
-                        if (std::abs((int)net_ids[0] - (int)cfg.sync_words[0]) > 2) {
-                            sync_ok = false;
+                    if (cfg.sync_words[0] != 0 || cfg.sync_words[1] != 0) {
+                        for (int i = 0; i < 2; i++) {
+                            long d = std::min(mod(nid[i] - cfg.sync_words[i], N),
+                                              mod(cfg.sync_words[i] - nid[i], N));
+                            if (d > 2) sync_ok = false;
                         }
                     }
-
                     if (!sync_ok) {
                         reset_state();
                         break;
@@ -443,26 +384,20 @@ public:
                     for (uint32_t n = 0; n < N; n++)
                         demod_downchirp[n] *= expj(-2.0f * (float)M_PI * m_cfo_frac / N * n);
 
-                    // Estimate SNR from a preamble symbol
+                    // Estimate SNR from a preamble symbol (CFO-frac corrected)
                     float snr_e = 0;
-                    if (preamble_raw.size() >= N) {
-                        float sig_e = 0, tot_e = 0;
-                        std::vector<float> fft_mag(N);
-                        std::vector<cx> dc(N);
-                        cx_multiply(dc.data(), preamble_raw.data(), downchirp.data(), N);
-                        kiss_fft_cpx *ci = new kiss_fft_cpx[N];
-                        kiss_fft_cpx *co = new kiss_fft_cpx[N];
-                        for (uint32_t i = 0; i < N; i++) { ci[i].r = dc[i].real(); ci[i].i = dc[i].imag(); }
-                        kiss_fft(fft_cfg, ci, co);
+                    {
+                        cx_multiply(symb_corr.data(), preamble_raw.data(), CFO_frac_correc.data(), N);
+                        cx_multiply(dechirp_buf.data(), symb_corr.data(), downchirp.data(), N);
+                        fft_N(dechirp_buf.data(), fft_out.data());
+                        float tot_e = 0, sig_e = 0;
                         for (uint32_t i = 0; i < N; i++) {
-                            fft_mag[i] = co[i].r * co[i].r + co[i].i * co[i].i;
-                            tot_e += fft_mag[i];
+                            float m = std::norm(fft_out[i]);
+                            tot_e += m;
+                            if (m > sig_e) sig_e = m;
                         }
-                        int mi = (int)(std::max_element(fft_mag.begin(), fft_mag.end()) - fft_mag.begin());
-                        sig_e = fft_mag[mi];
-                        if (tot_e > sig_e) snr_e = 10.0f * log10f(sig_e / (tot_e - sig_e));
-                        delete[] ci;
-                        delete[] co;
+                        if (tot_e > sig_e && sig_e > 0)
+                            snr_e = 10.0f * log10f(sig_e / (tot_e - sig_e));
                     }
                     current_snr = snr_e;
 
@@ -474,17 +409,21 @@ public:
 
                     // Reset payload decode state
                     fft_block.clear();
+                    hard_block.clear();
                     nibbles.clear();
                     is_header = true;
                     m_pay_cr = cfg.cr;
                     m_pay_len = cfg.pay_len;
                     m_pay_has_crc = cfg.has_crc;
 
-                    items_to_consume = sps / 4 + os * m_cfo_int;
+                    items_to_consume = sps / 4 + (long)os * m_cfo_int;
                     if (items_to_consume < 0) items_to_consume = 0;
 
-                    fprintf(stderr, "[sync] Frame #%u detected, CFO=%.2f, SNR=%.1f dB\n",
-                            frame_cnt, m_cfo_int + m_cfo_frac, snr_e);
+                    {
+                        std::lock_guard<std::mutex> lk(g_print_mtx);
+                        fprintf(stderr, "%s[sync] Frame #%u detected, CFO=%.2f, sync=0x%02X, SNR=%.1f dB\n",
+                                tag.c_str(), frame_cnt, m_cfo_int + m_cfo_frac, det_sync, snr_e);
+                    }
                     break;
                 }
                 default:
@@ -495,7 +434,6 @@ public:
 
             case PAYLOAD: {
                 if (payload_symbol_cnt < 8 || ((uint32_t)payload_symbol_cnt < total_payload_symbols && m_received_head)) {
-                    // Output downsampled symbol for demodulation
                     demodulate_symbol(in_down.data());
                     items_to_consume = sps;
 
@@ -520,27 +458,69 @@ public:
             }
 
             // Consume processed samples
-            if (items_to_consume > 0 && items_to_consume <= (int)ring.size())
-                ring.erase(ring.begin(), ring.begin() + items_to_consume);
-            else if (items_to_consume <= 0)
-                break; // waiting state, don't consume
-            else
-                break; // not enough data
+            if (items_to_consume > 0 && (size_t)items_to_consume <= avail()) {
+                head += items_to_consume;
+                compact();
+            } else {
+                break; // waiting state or not enough data
+            }
         }
     }
 
 private:
     LoRaConfig cfg;
+    std::string tag;
     uint32_t N;    // number of bins = 2^sf
     uint8_t os;    // oversampling factor
     uint32_t sps;  // samples per symbol
 
     std::vector<cx> upchirp, downchirp;
     std::vector<cx> demod_upchirp, demod_downchirp;
-    kiss_fft_cfg fft_cfg;
+    kiss_fft_cfg fft_cfg, fft_cfg2;
 
-    // Ring buffer for incoming samples
+    // FFT scratch (preallocated, reused every symbol)
+    std::vector<cx> dechirp_buf, fft_out;
+    std::vector<float> fft_mag;
+    std::vector<cx> cfo_fft_val;
+
+    // Gray demap LUTs
+    std::vector<uint16_t> demap_pay, demap_hdr;
+
+    // Anti-alias decimation FIR
+    std::vector<float> fir_taps;
+    int fir_delay = 0;
+
+    // Incoming sample buffer: consumed by advancing `head`, compacted rarely
     std::vector<cx> ring;
+    size_t head = 0;
+
+    size_t avail() const { return ring.size() - head; }
+
+    void compact() {
+        if (head > (size_t)(1 << 17)) {
+            // Keep fir_delay samples of history before head for the FIR
+            size_t drop = head - fir_delay;
+            ring.erase(ring.begin(), ring.begin() + drop);
+            head = fir_delay;
+        }
+    }
+
+    // Filtered sample at full-rate index idx (relative to head).
+    // Applies the anti-alias low-pass; identity when os == 1.
+    inline cx sample_at(long idx) const {
+        if (fir_taps.empty()) return ring[head + idx];
+        long base = (long)head + idx - fir_delay;
+        const int T = (int)fir_taps.size();
+        int k0 = base < 0 ? (int)(-base) : 0;
+        cx acc(0, 0);
+        for (int k = k0; k < T; k++)
+            acc += fir_taps[k] * ring[base + k];
+        return acc;
+    }
+
+    inline void fft_N(const cx *in, cx *out) {
+        kiss_fft(fft_cfg, (const kiss_fft_cpx *)in, (kiss_fft_cpx *)out);
+    }
 
     // Frame sync state
     enum State { DETECT, SYNC, PAYLOAD };
@@ -553,10 +533,7 @@ private:
     int up_symb_to_use;
     std::vector<int> preamb_up_vals;
     std::vector<cx> preamble_raw;
-    std::vector<cx> preamble_raw_up;
     std::vector<cx> preamble_upchirps;
-    std::vector<cx> net_id_samp;
-    std::vector<cx> additional_symbol_samp;
     std::vector<cx> in_down;
     std::vector<cx> symb_corr;
     std::vector<cx> CFO_frac_correc;
@@ -570,7 +547,7 @@ private:
     bool cfo_frac_sto_frac_est;
     uint8_t additional_upchirps;
     int down_val;
-    unsigned int frame_cnt;
+    unsigned int frame_cnt = 0;
     float current_snr;
 
     // Payload demod state
@@ -584,9 +561,9 @@ private:
     bool m_pay_has_crc;
 
     // Demod pipeline buffers
-    std::vector<std::vector<double>> fft_block; // LLR blocks for soft decoding
-    std::vector<uint16_t> hard_block;           // symbol values for hard decoding
-    std::vector<uint8_t> nibbles;               // decoded nibbles
+    std::vector<std::array<double, MAX_SF>> fft_block; // LLR blocks for soft decoding
+    std::vector<uint16_t> hard_block;                  // symbol values for hard decoding
+    std::vector<uint8_t> nibbles;                      // decoded nibbles
 
     void reset_state() {
         state = DETECT;
@@ -601,6 +578,7 @@ private:
         cfo_frac_sto_frac_est = false;
         additional_upchirps = 0;
         down_val = 0;
+        net_ids[0] = net_ids[1] = 0;
         payload_symbol_cnt = 0;
         total_payload_symbols = 0;
         m_received_head = false;
@@ -611,79 +589,73 @@ private:
         nibbles.clear();
     }
 
+    // Dechirp + FFT, return argmax bin
+    uint32_t fft_argmax(const cx *samples, const cx *ref_chirp, float *energy_out = nullptr) {
+        cx_multiply(dechirp_buf.data(), samples, ref_chirp, N);
+        fft_N(dechirp_buf.data(), fft_out.data());
+        float max_val = -1;
+        uint32_t max_idx = 0;
+        float tot_en = 0;
+        for (uint32_t i = 0; i < N; i++) {
+            float mag = std::norm(fft_out[i]);
+            tot_en += mag;
+            if (mag > max_val) { max_val = mag; max_idx = i; }
+        }
+        if (energy_out) *energy_out = tot_en;
+        return (tot_en > 0) ? max_idx : (uint32_t)-1;
+    }
+
     // ---- CFO estimation (Bernier's algorithm) ----
     float estimate_CFO_frac_Bernier(const cx *samples) {
         std::vector<int> k0v(up_symb_to_use);
         std::vector<double> k0_mag(up_symb_to_use);
-        std::vector<cx> fft_val(up_symb_to_use * N);
-        std::vector<cx> dechirped(N);
-
-        kiss_fft_cpx *ci = new kiss_fft_cpx[N];
-        kiss_fft_cpx *co = new kiss_fft_cpx[N];
 
         for (int i = 0; i < up_symb_to_use; i++) {
-            cx_multiply(dechirped.data(), &samples[N * i], downchirp.data(), N);
-            for (uint32_t j = 0; j < N; j++) { ci[j].r = dechirped[j].real(); ci[j].i = dechirped[j].imag(); }
-            kiss_fft(fft_cfg, ci, co);
+            cx_multiply(dechirp_buf.data(), &samples[N * i], downchirp.data(), N);
+            fft_N(dechirp_buf.data(), &cfo_fft_val[i * N]);
 
             float max_mag = -1;
             int max_idx = 0;
             for (uint32_t j = 0; j < N; j++) {
-                float m = co[j].r * co[j].r + co[j].i * co[j].i;
-                fft_val[j + i * N] = cx(co[j].r, co[j].i);
-                if (m > max_mag) { max_mag = m; max_idx = j; }
+                float m = std::norm(cfo_fft_val[j + i * N]);
+                if (m > max_mag) { max_mag = m; max_idx = (int)j; }
             }
             k0v[i] = max_idx;
             k0_mag[i] = max_mag;
         }
-        delete[] ci;
-        delete[] co;
 
         int best = (int)(std::max_element(k0_mag.begin(), k0_mag.end()) - k0_mag.begin());
         int idx_max = k0v[best];
 
         cx four_cum(0, 0);
         for (int i = 0; i < up_symb_to_use - 1; i++)
-            four_cum += fft_val[idx_max + N * i] * std::conj(fft_val[idx_max + N * (i + 1)]);
+            four_cum += cfo_fft_val[idx_max + N * i] * std::conj(cfo_fft_val[idx_max + N * (i + 1)]);
 
         float cfo_frac = -std::arg(four_cum) / (2.0f * (float)M_PI);
 
         // Correct CFO in preamble
-        std::vector<cx> correc(up_symb_to_use * N);
         for (int n = 0; n < up_symb_to_use * (int)N; n++)
-            correc[n] = expj(-2.0f * (float)M_PI * cfo_frac / N * n);
-        cx_multiply(preamble_upchirps.data(), samples, correc.data(), up_symb_to_use * N);
+            preamble_upchirps[n] = samples[n] * expj(-2.0f * (float)M_PI * cfo_frac / N * n);
 
         return cfo_frac;
     }
 
     // ---- STO fractional estimation (RCTSL) ----
     float estimate_STO_frac() {
-        std::vector<float> fft_mag_sq(2 * N, 0);
-        std::vector<cx> dechirped(N);
-
-        kiss_fft_cpx *ci = new kiss_fft_cpx[2 * N];
-        kiss_fft_cpx *co = new kiss_fft_cpx[2 * N];
-        kiss_fft_cfg cfg2 = kiss_fft_alloc(2 * N, 0, nullptr, nullptr);
+        std::fill(fft_mag.begin(), fft_mag.end(), 0.0f);
 
         for (int i = 0; i < up_symb_to_use; i++) {
-            cx_multiply(dechirped.data(), &preamble_upchirps[N * i], downchirp.data(), N);
-            for (uint32_t j = 0; j < 2 * N; j++) {
-                if (j < N) { ci[j].r = dechirped[j].real(); ci[j].i = dechirped[j].imag(); }
-                else { ci[j].r = 0; ci[j].i = 0; }
-            }
-            kiss_fft(cfg2, ci, co);
+            cx_multiply(dechirp_buf.data(), &preamble_upchirps[N * i], downchirp.data(), N);
+            std::fill(dechirp_buf.begin() + N, dechirp_buf.begin() + 2 * N, cx(0, 0));
+            kiss_fft(fft_cfg2, (const kiss_fft_cpx *)dechirp_buf.data(), (kiss_fft_cpx *)fft_out.data());
             for (uint32_t j = 0; j < 2 * N; j++)
-                fft_mag_sq[j] += co[j].r * co[j].r + co[j].i * co[j].i;
+                fft_mag[j] += std::norm(fft_out[j]);
         }
-        free(cfg2);
-        delete[] ci;
-        delete[] co;
 
-        int k0 = (int)(std::max_element(fft_mag_sq.begin(), fft_mag_sq.end()) - fft_mag_sq.begin());
-        double Y_1 = fft_mag_sq[mod(k0 - 1, 2 * N)];
-        double Y0 = fft_mag_sq[k0];
-        double Y1 = fft_mag_sq[mod(k0 + 1, 2 * N)];
+        int k0 = (int)(std::max_element(fft_mag.begin(), fft_mag.end()) - fft_mag.begin());
+        double Y_1 = fft_mag[mod(k0 - 1, 2 * N)];
+        double Y0 = fft_mag[k0];
+        double Y1 = fft_mag[mod(k0 + 1, 2 * N)];
 
         double u = 64.0 * N / 406.5506497;
         double v = u * 2.4674;
@@ -699,24 +671,15 @@ private:
         int block_size = 4 + (is_header ? 4 : m_pay_cr);
 
         if (cfg.soft_decoding) {
-            // Compute LLRs
-            std::vector<double> LLRs = compute_LLRs(symbol);
-            fft_block.push_back(LLRs);
-
+            fft_block.push_back(compute_LLRs(symbol));
             if ((int)fft_block.size() == block_size) {
-                // Deinterleave + Hamming decode the block
                 decode_block_soft();
                 fft_block.clear();
             }
         } else {
-            // Hard demod
-            uint32_t idx = fft_argmax(symbol, demod_downchirp.data(), N, fft_cfg);
-            uint16_t val = (uint16_t)mod((long)idx - 1, (1L << cfg.sf));
-            if (is_header || m_ldro) val /= 4;
-            // Gray demap
-            val = val ^ (val >> 1);
-            hard_block.push_back(val);
-
+            uint32_t idx = fft_argmax(symbol, demod_downchirp.data());
+            const uint16_t *map = (is_header || m_ldro) ? demap_hdr.data() : demap_pay.data();
+            hard_block.push_back(map[idx == (uint32_t)-1 ? 0 : idx]);
             if ((int)hard_block.size() == block_size) {
                 decode_block_hard();
                 hard_block.clear();
@@ -724,58 +687,26 @@ private:
         }
     }
 
-    // ---- Compute LLRs for one symbol (soft demod) ----
-    std::vector<double> compute_LLRs(const cx *samples) {
-        std::vector<cx> dechirped(N);
-        cx_multiply(dechirped.data(), samples, demod_downchirp.data(), N);
-
-        kiss_fft_cpx *ci = new kiss_fft_cpx[N];
-        kiss_fft_cpx *co = new kiss_fft_cpx[N];
-        for (uint32_t i = 0; i < N; i++) { ci[i].r = dechirped[i].real(); ci[i].i = dechirped[i].imag(); }
-        kiss_fft(fft_cfg, ci, co);
-
-        std::vector<float> fft_mag_sq(N);
+    // ---- Compute LLRs for one symbol (soft demod, max-log approximation) ----
+    std::array<double, MAX_SF> compute_LLRs(const cx *samples) {
+        cx_multiply(dechirp_buf.data(), samples, demod_downchirp.data(), N);
+        fft_N(dechirp_buf.data(), fft_out.data());
         for (uint32_t i = 0; i < N; i++)
-            fft_mag_sq[i] = co[i].r * co[i].r + co[i].i * co[i].i;
+            fft_mag[i] = std::norm(fft_out[i]);
 
-        delete[] ci;
-        delete[] co;
+        const uint16_t *map = (is_header || m_ldro) ? demap_hdr.data() : demap_pay.data();
 
-        // SNR estimation
-        int symbol_idx = (int)(std::max_element(fft_mag_sq.begin(), fft_mag_sq.end()) - fft_mag_sq.begin());
-        double signal_energy = 0, noise_energy = 0;
-        for (uint32_t i = 0; i < N; i++) {
-            if (mod(std::abs((int)i - symbol_idx), N - 1) < 2)
-                signal_energy += fft_mag_sq[i];
-            else
-                noise_energy += fft_mag_sq[i];
-        }
-        (void)signal_energy;
-        (void)noise_energy;
-
-        // Normalize FFT magnitudes
-        for (uint32_t i = 0; i < N; i++)
-            fft_mag_sq[i] *= N;
-
-        // Use max-log approximation with |Y[n]|^2 directly (avoids Bessel overflow)
-        std::vector<double> LLs(N);
-        for (uint32_t n = 0; n < N; n++)
-            LLs[n] = (double)fft_mag_sq[n];
-
-        // Compute LLRs (max-log approximation)
-        std::vector<double> LLRs(MAX_SF, 0);
+        std::array<double, MAX_SF> LLRs{};
         for (uint32_t i = 0; i < cfg.sf; i++) {
-            double max_X1 = -1e30, max_X0 = -1e30;
+            float max_X1 = -1, max_X0 = -1;
             for (uint32_t n = 0; n < N; n++) {
-                uint32_t s = (uint32_t)mod((long)n - 1, (1L << cfg.sf)) / ((is_header || m_ldro) ? 4 : 1);
-                s = s ^ (s >> 1); // Gray demap
-                if (s & (1u << i)) {
-                    if (LLs[n] > max_X1) max_X1 = LLs[n];
+                if (map[n] & (1u << i)) {
+                    if (fft_mag[n] > max_X1) max_X1 = fft_mag[n];
                 } else {
-                    if (LLs[n] > max_X0) max_X0 = LLs[n];
+                    if (fft_mag[n] > max_X0) max_X0 = fft_mag[n];
                 }
             }
-            LLRs[cfg.sf - 1 - i] = max_X1 - max_X0;
+            LLRs[cfg.sf - 1 - i] = (double)max_X1 - (double)max_X0;
         }
         return LLRs;
     }
@@ -787,25 +718,15 @@ private:
         int cr_app = is_header ? 4 : m_pay_cr;
 
         // Deinterleave
-        std::vector<std::vector<double>> inter_bin(cw_len, std::vector<double>(sf_app, 0));
-        std::vector<std::vector<double>> deinter_bin(sf_app, std::vector<double>(cw_len, 0));
-
-        for (int i = 0; i < cw_len; i++) {
-            for (int j = 0; j < sf_app; j++)
-                inter_bin[i][j] = fft_block[i][cfg.sf - sf_app + j];
-        }
-
+        double deinter[MAX_SF][8];
         for (int i = 0; i < cw_len; i++)
             for (int j = 0; j < sf_app; j++)
-                deinter_bin[mod(i - j - 1, sf_app)][i] = inter_bin[i][j];
+                deinter[mod(i - j - 1, sf_app)][i] = fft_block[i][cfg.sf - sf_app + j];
 
         // Hamming decode each codeword
-        for (int i = 0; i < sf_app; i++) {
-            uint8_t nibble = hamming_decode_soft(deinter_bin[i].data(), cr_app);
-            nibbles.push_back(nibble);
-        }
+        for (int i = 0; i < sf_app; i++)
+            nibbles.push_back(hamming_decode_soft(deinter[i], cr_app));
 
-        // Try to decode header or process payload
         process_nibbles();
     }
 
@@ -815,27 +736,16 @@ private:
         int cw_len = is_header ? 8 : m_pay_cr + 4;
         int cr_app = is_header ? 4 : m_pay_cr;
 
-        // Deinterleave
-        // Convert symbols to binary
-        std::vector<std::vector<bool>> inter_bin(cw_len);
-        for (int i = 0; i < cw_len; i++) {
-            inter_bin[i].resize(sf_app);
-            for (int j = 0; j < sf_app; j++)
-                inter_bin[i][j] = (hard_block[i] >> (sf_app - 1 - j)) & 1;
-        }
-
-        std::vector<std::vector<bool>> deinter_bin(sf_app, std::vector<bool>(cw_len, false));
+        uint8_t deinter[MAX_SF][8] = {};
         for (int i = 0; i < cw_len; i++)
             for (int j = 0; j < sf_app; j++)
-                deinter_bin[mod(i - j - 1, sf_app)][i] = inter_bin[i][j];
+                deinter[mod(i - j - 1, sf_app)][i] = (hard_block[i] >> (sf_app - 1 - j)) & 1;
 
-        // Convert back and hamming decode
         for (int i = 0; i < sf_app; i++) {
             uint8_t cw_byte = 0;
             for (int j = 0; j < cw_len; j++)
-                cw_byte = (cw_byte << 1) | deinter_bin[i][j];
-            uint8_t nibble = hamming_decode_hard(cw_byte, cr_app);
-            nibbles.push_back(nibble);
+                cw_byte = (cw_byte << 1) | deinter[i][j];
+            nibbles.push_back(hamming_decode_hard(cw_byte, cr_app));
         }
 
         process_nibbles();
@@ -863,15 +773,22 @@ private:
 
             int computed_chk = (c4 << 4) | (c3 << 3) | (c2 << 2) | (c1 << 1) | c0;
 
-            fprintf(stderr, "  Header: pay_len=%u, CRC=%d, CR=%d\n", m_pay_len, m_pay_has_crc, m_pay_cr);
+            {
+                std::lock_guard<std::mutex> lk(g_print_mtx);
+                fprintf(stderr, "%s  Header: pay_len=%u, CRC=%d, CR=%d\n", tag.c_str(), m_pay_len, m_pay_has_crc, m_pay_cr);
+            }
 
             if (computed_chk != header_chk || m_pay_len == 0) {
-                fprintf(stderr, "  Header checksum INVALID!\n");
+                std::lock_guard<std::mutex> lk(g_print_mtx);
+                fprintf(stderr, "%s  Header checksum INVALID!\n", tag.c_str());
                 reset_state();
                 return;
             }
 
-            fprintf(stderr, "  Header checksum valid\n");
+            {
+                std::lock_guard<std::mutex> lk(g_print_mtx);
+                fprintf(stderr, "%s  Header checksum valid\n", tag.c_str());
+            }
 
             // Determine LDRO
             m_ldro = ((float)(1u << cfg.sf) * 1e3f / cfg.bw) > LDRO_MAX_DURATION_MS;
@@ -884,8 +801,7 @@ private:
             is_header = false;
 
             // Remove header nibbles, keep remaining payload nibbles
-            std::vector<uint8_t> remaining(nibbles.begin() + 5, nibbles.end());
-            nibbles = remaining;
+            nibbles.erase(nibbles.begin(), nibbles.begin() + 5);
 
         } else if (is_header && cfg.impl_head) {
             // Implicit header - parameters from config
@@ -937,36 +853,39 @@ private:
             pkt.crc_valid = true; // no CRC to check
         }
 
-        // Print output
-        printf("rx msg: ");
-        for (uint32_t i = 0; i < m_pay_len; i++) {
-            if (i > 0) printf(", ");
-            printf("0x%02x", pkt.payload[i]);
-        }
-        printf("\n");
+        {
+            std::lock_guard<std::mutex> lk(g_print_mtx);
 
-        // Also print as ASCII if printable
-        bool printable = true;
-        for (uint32_t i = 0; i < m_pay_len; i++)
-            if (pkt.payload[i] < 0x20 || pkt.payload[i] > 0x7e) { printable = false; break; }
-        if (printable) {
-            printf("rx str: ");
-            for (uint32_t i = 0; i < m_pay_len; i++) putchar(pkt.payload[i]);
+            printf("rx msg: ");
+            for (uint32_t i = 0; i < m_pay_len; i++) {
+                if (i > 0) printf(", ");
+                printf("0x%02x", pkt.payload[i]);
+            }
             printf("\n");
+
+            // Also print as ASCII if printable
+            bool printable = true;
+            for (uint32_t i = 0; i < m_pay_len; i++)
+                if (pkt.payload[i] < 0x20 || pkt.payload[i] > 0x7e) { printable = false; break; }
+            if (printable) {
+                printf("rx str: ");
+                for (uint32_t i = 0; i < m_pay_len; i++) putchar(pkt.payload[i]);
+                printf("\n");
+            }
+
+            if (pkt.has_crc) {
+                if (pkt.crc_valid)
+                    printf("CRC valid!\n\n");
+                else
+                    printf("\033[31mCRC invalid\033[0m\n\n");
+            } else {
+                printf("(no CRC)\n\n");
+            }
+
+            fflush(stdout);
         }
 
-        if (pkt.has_crc) {
-            if (pkt.crc_valid)
-                printf("CRC valid!\n\n");
-            else
-                printf("\033[31mCRC invalid\033[0m\n\n");
-        } else {
-            printf("(no CRC)\n\n");
-        }
-
-        fflush(stdout);
         last_packets.push_back(pkt);
-
         nibbles.clear();
     }
 
@@ -979,51 +898,128 @@ private:
 };
 
 // ============================================================================
-// RTL-SDR async callback
+// Worker: one demodulator on its own thread, fed via a bounded queue
 // ============================================================================
 
-struct RtlContext {
-    LoRaDemodulator *demod;
-    int n_samples;
-};
-
-static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx) {
-    if (!g_running) return;
-    RtlContext *rc = (RtlContext *)ctx;
-
-    int n = len / 2;
-    std::vector<cx> samples(n);
-    for (int i = 0; i < n; i++) {
-        float re = ((float)buf[2 * i]     - 127.5f) / 127.5f;
-        float im = ((float)buf[2 * i + 1] - 127.5f) / 127.5f;
-        samples[i] = cx(re, im);
+class DemodWorker {
+public:
+    DemodWorker(const LoRaConfig &c, const std::string &tag)
+        : demod(c, tag), tag_(tag) {
+        th = std::thread([this] { run(); });
     }
 
-    rc->demod->process_samples(samples.data(), n);
+    void push(std::shared_ptr<const std::vector<cx>> chunk) {
+        std::unique_lock<std::mutex> lk(mtx);
+        cv_space.wait(lk, [&] { return q.size() < MAX_Q || stopping; });
+        if (stopping) return;
+        q.push_back(std::move(chunk));
+        cv_data.notify_one();
+    }
+
+    // Signals end of stream; drains the queue, then joins the thread.
+    void finish() {
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            stopping = true;
+        }
+        cv_data.notify_all();
+        cv_space.notify_all();
+        if (th.joinable()) th.join();
+    }
+
+    size_t packet_count() const { return demod.last_packets.size(); }
+    const std::string &tag() const { return tag_; }
+
+private:
+    void run() {
+        for (;;) {
+            std::shared_ptr<const std::vector<cx>> chunk;
+            {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv_data.wait(lk, [&] { return !q.empty() || stopping; });
+                if (q.empty()) return; // stopping and drained
+                chunk = std::move(q.front());
+                q.pop_front();
+                cv_space.notify_one();
+            }
+            demod.process_samples(chunk->data(), chunk->size());
+        }
+    }
+
+    LoRaDemodulator demod;
+    std::string tag_;
+    std::thread th;
+    std::mutex mtx;
+    std::condition_variable cv_data, cv_space;
+    std::deque<std::shared_ptr<const std::vector<cx>>> q;
+    bool stopping = false;
+    static constexpr size_t MAX_Q = 64;
+};
+
+// ============================================================================
+// Sample source -> workers fan-out
+// ============================================================================
+
+static float g_u8lut[256];
+static std::vector<std::unique_ptr<DemodWorker>> g_workers;
+static FILE *g_dump = nullptr;
+
+static void broadcast_u8(const unsigned char *buf, uint32_t len) {
+    if (g_dump) fwrite(buf, 1, len, g_dump);
+
+    size_t n = len / 2;
+    auto chunk = std::make_shared<std::vector<cx>>(n);
+    auto &v = *chunk;
+    for (size_t i = 0; i < n; i++)
+        v[i] = cx(g_u8lut[buf[2 * i]], g_u8lut[buf[2 * i + 1]]);
+
+    for (auto &w : g_workers)
+        w->push(chunk);
+}
+
+static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *) {
+    if (!g_running) return;
+    broadcast_u8(buf, len);
 }
 
 // ============================================================================
 // Main
 // ============================================================================
 
+static std::string make_tag(uint8_t sf, uint32_t bw) {
+    char buf[32];
+    if (bw % 1000 == 0)
+        snprintf(buf, sizeof(buf), "[SF%u/%uk] ", sf, bw / 1000);
+    else
+        snprintf(buf, sizeof(buf), "[SF%u/%.1fk] ", sf, bw / 1000.0);
+    return buf;
+}
+
 int main(int argc, char *argv[]) {
     LoRaConfig cfg;
+    const char *iq_file = nullptr;
+    const char *dump_file = nullptr;
+    bool auto_mode = false, sf_given = false, bw_given = false;
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:p:IL:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:p:IL:r:D:A")) != -1) {
         switch (opt) {
         case 'f': cfg.freq = (uint32_t)atol(optarg); break;
         case 's': cfg.samp_rate = (uint32_t)atol(optarg); break;
-        case 'b': cfg.bw = (uint32_t)atol(optarg); break;
-        case 'S': cfg.sf = (uint8_t)atoi(optarg); break;
+        case 'b': cfg.bw = (uint32_t)atol(optarg); bw_given = true; break;
+        case 'S': cfg.sf = (uint8_t)atoi(optarg); sf_given = true; break;
         case 'c': cfg.cr = (uint8_t)atoi(optarg); break;
         case 'w': cfg.sync_word = (uint16_t)strtol(optarg, nullptr, 16); break;
         case 'g': cfg.gain = atoi(optarg); break;
         case 'p': cfg.ppm = atoi(optarg); break;
         case 'I': cfg.impl_head = true; break;
         case 'L': cfg.pay_len = (uint32_t)atoi(optarg); break;
+        case 'r': iq_file = optarg; break;
+        case 'D': dump_file = optarg; break;
+        case 'A': auto_mode = true; break;
         default:
-            fprintf(stderr, "Usage: %s [-f freq] [-s samp_rate] [-b bw] [-S sf] [-c cr] [-w sync_word_hex] [-g gain] [-p ppm] [-I] [-L pay_len]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-f freq] [-s samp_rate] [-b bw] [-S sf] [-c cr] [-w sync_word_hex]\n"
+                            "          [-g gain] [-p ppm] [-I] [-L pay_len] [-A] [-r iq_file] [-D dump_file]\n", argv[0]);
             return 1;
         }
     }
@@ -1032,69 +1028,137 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "SF must be between %d and %d\n", MIN_SF, MAX_SF);
         return 1;
     }
+    if (cfg.cr < 1 || cfg.cr > 4) {
+        uint8_t clamped = cfg.cr < 1 ? 1 : 4;
+        fprintf(stderr, "Warning: CR %u out of range 1-4, using %u (explicit header overrides it anyway)\n",
+                cfg.cr, clamped);
+        cfg.cr = clamped;
+    }
     if (cfg.samp_rate % cfg.bw != 0) {
         fprintf(stderr, "Warning: samp_rate should be an integer multiple of bandwidth\n");
     }
 
-    cfg.compute_derived();
+    for (int i = 0; i < 256; i++)
+        g_u8lut[i] = ((float)i - 127.5f) / 127.5f;
 
+    // Build the list of (SF, BW) decoder configurations
+    std::vector<uint8_t> sfs = {cfg.sf};
+    std::vector<uint32_t> bws = {cfg.bw};
+    if (auto_mode) {
+        if (!sf_given) sfs = {7, 8, 9, 10, 11, 12};
+        if (!bw_given) {
+            bws.clear();
+            for (uint32_t bw : {62500u, 125000u, 250000u, 500000u}) {
+                if (bw <= cfg.samp_rate && cfg.samp_rate % bw == 0 && cfg.samp_rate / bw <= 16)
+                    bws.push_back(bw);
+            }
+            if (bws.empty()) bws = {cfg.bw};
+        }
+    }
+
+    bool multi = sfs.size() * bws.size() > 1;
+    for (uint32_t bw : bws) {
+        for (uint8_t sf : sfs) {
+            LoRaConfig c = cfg;
+            c.sf = sf;
+            c.bw = bw;
+            c.compute_derived();
+            g_workers.emplace_back(new DemodWorker(c, multi ? make_tag(sf, bw) : ""));
+        }
+    }
+
+    cfg.compute_derived();
     fprintf(stderr, "LoRa Standalone RX\n");
     fprintf(stderr, "  Freq:       %u Hz\n", cfg.freq);
     fprintf(stderr, "  Samp rate:  %u Hz\n", cfg.samp_rate);
-    fprintf(stderr, "  Bandwidth:  %u Hz\n", cfg.bw);
-    fprintf(stderr, "  SF:         %u\n", cfg.sf);
-    fprintf(stderr, "  CR:         4/%u\n", cfg.cr + 4);
-    fprintf(stderr, "  Sync word:  0x%02X\n", cfg.sync_word);
-    fprintf(stderr, "  OS factor:  %u\n", cfg.os_factor);
-    fprintf(stderr, "  Bins:       %u\n", cfg.n_bins);
-    fprintf(stderr, "  Samples/sym: %u\n", cfg.samples_per_symbol);
+    if (multi) {
+        fprintf(stderr, "  Decoders:   %zu in parallel:", g_workers.size());
+        for (auto &w : g_workers) fprintf(stderr, " %s", w->tag().c_str());
+        fprintf(stderr, "\n");
+    } else {
+        fprintf(stderr, "  Bandwidth:  %u Hz\n", cfg.bw);
+        fprintf(stderr, "  SF:         %u\n", cfg.sf);
+        fprintf(stderr, "  OS factor:  %u\n", cfg.os_factor);
+        fprintf(stderr, "  Bins:       %u\n", cfg.n_bins);
+        fprintf(stderr, "  Samples/sym: %u\n", cfg.samples_per_symbol);
+    }
+    fprintf(stderr, "  CR:         4/%u (explicit header overrides)\n", cfg.cr + 4);
+    fprintf(stderr, "  Sync word:  0x%02X%s\n", cfg.sync_word, cfg.sync_word == 0 ? " (accept any)" : "");
     fprintf(stderr, "  Implicit:   %s\n", cfg.impl_head ? "yes" : "no");
     fprintf(stderr, "  Soft decode: %s\n", cfg.soft_decoding ? "yes" : "no");
     fprintf(stderr, "\n");
 
-    // Open RTL-SDR
-    rtlsdr_dev_t *dev = nullptr;
-    int dev_index = 0;
-
-    int n_devices = rtlsdr_get_device_count();
-    if (n_devices == 0) {
-        fprintf(stderr, "No RTL-SDR devices found\n");
-        return 1;
+    if (dump_file) {
+        g_dump = fopen(dump_file, "wb");
+        if (!g_dump) {
+            perror("dump file");
+            return 1;
+        }
+        fprintf(stderr, "Dumping raw IQ to %s\n", dump_file);
     }
-    fprintf(stderr, "Found %d RTL-SDR device(s)\n", n_devices);
-
-    if (rtlsdr_open(&dev, dev_index) < 0) {
-        fprintf(stderr, "Failed to open RTL-SDR device\n");
-        return 1;
-    }
-    g_dev = dev;
-
-    // Configure
-    rtlsdr_set_sample_rate(dev, cfg.samp_rate);
-    rtlsdr_set_center_freq(dev, cfg.freq);
-    rtlsdr_set_freq_correction(dev, cfg.ppm);
-    rtlsdr_set_tuner_gain_mode(dev, 1); // manual gain
-    rtlsdr_set_tuner_gain(dev, cfg.gain);
-    rtlsdr_set_agc_mode(dev, 0);
-    rtlsdr_reset_buffer(dev);
-
-    fprintf(stderr, "RTL-SDR configured. Tuner gain: %.1f dB\n", rtlsdr_get_tuner_gain(dev) / 10.0);
-    fprintf(stderr, "Listening...\n\n");
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    LoRaDemodulator demod(cfg);
-    RtlContext ctx = { &demod, 0 };
+    if (iq_file) {
+        // ---- Offline: replay IQ from file (rtl_sdr u8 format) ----
+        FILE *f = strcmp(iq_file, "-") == 0 ? stdin : fopen(iq_file, "rb");
+        if (!f) {
+            perror("iq file");
+            return 1;
+        }
+        fprintf(stderr, "Replaying IQ from %s...\n\n", iq_file);
+        std::vector<unsigned char> buf(1 << 18);
+        size_t nr;
+        while (g_running && (nr = fread(buf.data(), 1, buf.size(), f)) > 0)
+            broadcast_u8(buf.data(), (uint32_t)nr);
+        if (f != stdin) fclose(f);
+    } else {
+        // ---- Live: RTL-SDR ----
+        rtlsdr_dev_t *dev = nullptr;
+        int dev_index = 0;
 
-    // Use async read with a buffer size that's a good multiple of samples_per_symbol
-    // 16384 bytes = 8192 IQ samples
-    int buf_len = 16384;
+        int n_devices = rtlsdr_get_device_count();
+        if (n_devices == 0) {
+            fprintf(stderr, "No RTL-SDR devices found\n");
+            return 1;
+        }
+        fprintf(stderr, "Found %d RTL-SDR device(s)\n", n_devices);
 
-    rtlsdr_read_async(dev, rtlsdr_callback, &ctx, 0, buf_len);
+        if (rtlsdr_open(&dev, dev_index) < 0) {
+            fprintf(stderr, "Failed to open RTL-SDR device\n");
+            return 1;
+        }
+        g_dev = dev;
 
-    rtlsdr_close(dev);
+        rtlsdr_set_sample_rate(dev, cfg.samp_rate);
+        rtlsdr_set_center_freq(dev, cfg.freq);
+        rtlsdr_set_freq_correction(dev, cfg.ppm);
+        rtlsdr_set_tuner_gain_mode(dev, 1); // manual gain
+        rtlsdr_set_tuner_gain(dev, cfg.gain);
+        rtlsdr_set_agc_mode(dev, 0);
+        rtlsdr_reset_buffer(dev);
 
-    fprintf(stderr, "\nDone. Received %zu packets.\n", demod.last_packets.size());
+        fprintf(stderr, "RTL-SDR configured. Tuner gain: %.1f dB\n", rtlsdr_get_tuner_gain(dev) / 10.0);
+        fprintf(stderr, "Listening...\n\n");
+
+        // 16384 bytes = 8192 IQ samples per callback
+        rtlsdr_read_async(dev, rtlsdr_callback, nullptr, 0, 16384);
+
+        rtlsdr_close(dev);
+    }
+
+    size_t total = 0;
+    for (auto &w : g_workers)
+        w->finish();
+    fprintf(stderr, "\nDone.\n");
+    for (auto &w : g_workers) {
+        total += w->packet_count();
+        if (multi && w->packet_count() > 0)
+            fprintf(stderr, "  %s%zu packet(s)\n", w->tag().c_str(), w->packet_count());
+    }
+    fprintf(stderr, "Received %zu packet(s) total.\n", total);
+
+    if (g_dump) fclose(g_dump);
     return 0;
 }
