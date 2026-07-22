@@ -882,12 +882,22 @@ private:
 
             if (pkt.has_crc) {
                 if (pkt.crc_valid)
-                    printf("CRC valid!\n\n");
+                    printf("CRC valid!\n");
                 else
-                    printf("\033[31mCRC invalid\033[0m\n\n");
+                    printf("\033[31mCRC invalid\033[0m\n");
             } else {
-                printf("(no CRC)\n\n");
+                printf("(no CRC)\n");
             }
+
+            // Machine-readable line for CRC-valid packets only: plain hex,
+            // ready to pipe into a packet decoder (e.g. meshcore-decoder stream)
+            if (pkt.crc_valid) {
+                printf("rx ok: ");
+                for (uint32_t i = 0; i < m_pay_len; i++)
+                    printf("%02x", pkt.payload[i]);
+                printf("\n");
+            }
+            printf("\n");
 
             fflush(stdout);
         }

@@ -94,6 +94,15 @@ make check      # builds the offline frame generator and runs end-to-end tests (
 
 When more than one decoder runs, each packet on stdout is preceded by a `rx cfg: freq=... sf=... bw=...` line identifying which channel/decoder produced it (the `rx msg` / `rx str` / CRC line format itself is unchanged).
 
+CRC-valid packets additionally emit a machine-readable `rx ok: <hex>` line (plain hex, one line per packet), designed for piping into a packet decoder. For MeshCore, [meshcore-cpp-decoder](https://github.com/mmmaly/meshcore-cpp-decoder) consumes it directly with its `stream` command:
+
+```bash
+# Receive both meshes and decode/decrypt MeshCore packets in one pipeline
+./lora_rx -C 869432000,869618000 -S 7,8 | meshcore-decoder stream -K ~/.config/meshcore/keys.txt
+```
+
+Non-packet lines pass through the decoder untouched, so channel attribution and CRC status stay visible in the combined output.
+
 ### Output
 
 ```
