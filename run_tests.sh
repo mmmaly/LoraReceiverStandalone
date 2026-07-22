@@ -17,7 +17,10 @@ run_case() {
     eval "./lora_tx_gen -o '$TMP/t.iq' $genargs" 2>/dev/null
     local out
     out=$(eval "./lora_rx -r '$TMP/t.iq' $rxargs" 2>/dev/null || true)
-    if echo "$out" | grep -q "CRC valid" && echo "$out" | grep -qF "rx str: $expect"; then
+    local expect_hex
+    expect_hex=$(printf '%s' "$expect" | xxd -p | tr -d '\n')
+    if echo "$out" | grep -q "CRC valid" && echo "$out" | grep -qF "rx str: $expect" \
+       && echo "$out" | grep -qF "rx ok: $expect_hex"; then
         echo "PASS: $desc"
     else
         echo "FAIL: $desc"
