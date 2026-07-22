@@ -983,7 +983,13 @@ struct ChannelFanout {
 static std::vector<ChannelFanout> g_channels;
 
 static void broadcast_u8(const unsigned char *buf, uint32_t len) {
-    if (g_dump) fwrite(buf, 1, len, g_dump);
+    if (g_dump && fwrite(buf, 1, len, g_dump) != len) {
+        // Disk full or write error: a silently truncated dump is worse than
+        // no dump. Warn, stop dumping, keep receiving.
+        fprintf(stderr, "Warning: IQ dump write failed (disk full?) - dump disabled, reception continues\n");
+        fclose(g_dump);
+        g_dump = nullptr;
+    }
 
     size_t n = len / 2;
     auto base = std::make_shared<std::vector<cx>>(n);
