@@ -45,4 +45,27 @@ run_case "auto-scan finds SF10/62.5k" "-S 10 -b 62500 -s 250000 -c 1 -m 'AUTO TE
 # Unknown sync word: -w 0 accepts and reports it
 run_case "accept-any sync (-w 0)" "-S 8 -b 62500 -s 250000 -c 1 -w 34 -m 'SYNC TEST'" "-S 8 -b 62500 -s 250000 -w 0" "SYNC TEST"
 
+# Dual-channel: one 1 MS/s stream carrying two meshes 186 kHz apart
+# (Czech 869.432 MHz SF7 + Slovak 869.618 MHz SF8), transmitted
+# simultaneously. Tuner auto-centers at the midpoint; offsets are +/-93 kHz.
+./lora_tx_gen -o "$TMP/cz.iq" -S 7 -b 62500 -s 1000000 -c 1 -m 'CESKA SIT' -O -93000 2>/dev/null
+./lora_tx_gen -o "$TMP/sk.iq" -S 8 -b 62500 -s 1000000 -c 1 -m 'SLOVENSKA SIET' -O 93000 2>/dev/null
+python3 - "$TMP/cz.iq" "$TMP/sk.iq" "$TMP/mix.iq" <<'PY'
+import sys
+a = open(sys.argv[1], 'rb').read()
+b = open(sys.argv[2], 'rb').read()
+n = max(len(a), len(b))
+a += bytes([128]) * (n - len(a))
+b += bytes([128]) * (n - len(b))
+open(sys.argv[3], 'wb').write(bytes(min(255, max(0, x + y - 128)) for x, y in zip(a, b)))
+PY
+out=$(./lora_rx -r "$TMP/mix.iq" -s 1000000 -C 869432000,869618000 -S 7,8 -b 62500 2>/dev/null || true)
+if echo "$out" | grep -qF "rx str: CESKA SIT" && echo "$out" | grep -qF "rx str: SLOVENSKA SIET"; then
+    echo "PASS: dual-channel (one dongle, two meshes, simultaneous frames)"
+else
+    echo "FAIL: dual-channel (one dongle, two meshes, simultaneous frames)"
+    echo "$out" | sed 's/^/    /'
+    FAIL=1
+fi
+
 exit $FAIL

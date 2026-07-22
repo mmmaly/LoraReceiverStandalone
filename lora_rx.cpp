@@ -195,8 +195,8 @@ public:
 
     std::vector<Packet> last_packets;
 
-    LoRaDemodulator(const LoRaConfig &cfg_, std::string tag_ = "")
-        : cfg(cfg_), tag(std::move(tag_)) {
+    LoRaDemodulator(const LoRaConfig &cfg_, std::string tag_ = "", std::string stdout_tag_ = "")
+        : cfg(cfg_), tag(std::move(tag_)), stdout_tag(std::move(stdout_tag_)) {
         N = cfg.n_bins;
         os = cfg.os_factor;
         sps = cfg.samples_per_symbol;
@@ -470,6 +470,7 @@ public:
 private:
     LoRaConfig cfg;
     std::string tag;
+    std::string stdout_tag; // when non-empty, printed as "rx cfg: ..." before each packet
     uint32_t N;    // number of bins = 2^sf
     uint8_t os;    // oversampling factor
     uint32_t sps;  // samples per symbol
@@ -856,6 +857,8 @@ private:
         {
             std::lock_guard<std::mutex> lk(g_print_mtx);
 
+            if (!stdout_tag.empty())
+                printf("rx cfg: %s\n", stdout_tag.c_str());
             printf("rx msg: ");
             for (uint32_t i = 0; i < m_pay_len; i++) {
                 if (i > 0) printf(", ");
@@ -903,8 +906,8 @@ private:
 
 class DemodWorker {
 public:
-    DemodWorker(const LoRaConfig &c, const std::string &tag)
-        : demod(c, tag), tag_(tag) {
+    DemodWorker(const LoRaConfig &c, const std::string &tag, const std::string &stdout_tag)
+        : demod(c, tag, stdout_tag), tag_(tag) {
         th = std::thread([this] { run(); });
     }
 
@@ -964,17 +967,50 @@ static float g_u8lut[256];
 static std::vector<std::unique_ptr<DemodWorker>> g_workers;
 static FILE *g_dump = nullptr;
 
+// One entry per RF channel: frequency-shifts the shared stream to put that
+// channel at baseband, then fans out to the workers decoding it. This is how
+// one dongle covers several LoRa channels at once (e.g. -C f1,f2 at 1 MS/s).
+struct ChannelFanout {
+    uint32_t freq = 0;               // channel center frequency (Hz)
+    double phase = 0, phase_inc = 0; // oscillator state (radians, radians/sample)
+    bool identity = true;            // channel is at tuner center, no shift needed
+    std::vector<DemodWorker *> workers;
+};
+static std::vector<ChannelFanout> g_channels;
+
 static void broadcast_u8(const unsigned char *buf, uint32_t len) {
     if (g_dump) fwrite(buf, 1, len, g_dump);
 
     size_t n = len / 2;
-    auto chunk = std::make_shared<std::vector<cx>>(n);
-    auto &v = *chunk;
-    for (size_t i = 0; i < n; i++)
-        v[i] = cx(g_u8lut[buf[2 * i]], g_u8lut[buf[2 * i + 1]]);
+    auto base = std::make_shared<std::vector<cx>>(n);
+    {
+        auto &v = *base;
+        for (size_t i = 0; i < n; i++)
+            v[i] = cx(g_u8lut[buf[2 * i]], g_u8lut[buf[2 * i + 1]]);
+    }
 
-    for (auto &w : g_workers)
-        w->push(chunk);
+    for (auto &ch : g_channels) {
+        std::shared_ptr<const std::vector<cx>> chunk;
+        if (ch.identity) {
+            chunk = base;
+        } else {
+            auto shifted = std::make_shared<std::vector<cx>>(n);
+            const auto &v = *base;
+            auto &s = *shifted;
+            // Oscillator restarts from the double-precision phase each chunk,
+            // so float rounding never accumulates across the stream
+            cx osc((float)cos(ch.phase), (float)sin(ch.phase));
+            const cx step((float)cos(ch.phase_inc), (float)sin(ch.phase_inc));
+            for (size_t i = 0; i < n; i++) {
+                s[i] = v[i] * osc;
+                osc *= step;
+            }
+            ch.phase = fmod(ch.phase + ch.phase_inc * (double)n, 2.0 * M_PI);
+            chunk = std::move(shifted);
+        }
+        for (auto *w : ch.workers)
+            w->push(chunk);
+    }
 }
 
 static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *) {
@@ -986,28 +1022,46 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *) {
 // Main
 // ============================================================================
 
-static std::string make_tag(uint8_t sf, uint32_t bw) {
-    char buf[32];
+static std::string make_tag(uint32_t chan_freq, uint8_t sf, uint32_t bw) {
+    char bwbuf[16], buf[48];
     if (bw % 1000 == 0)
-        snprintf(buf, sizeof(buf), "[SF%u/%uk] ", sf, bw / 1000);
+        snprintf(bwbuf, sizeof(bwbuf), "%uk", bw / 1000);
     else
-        snprintf(buf, sizeof(buf), "[SF%u/%.1fk] ", sf, bw / 1000.0);
+        snprintf(bwbuf, sizeof(bwbuf), "%.1fk", bw / 1000.0);
+    if (chan_freq)
+        snprintf(buf, sizeof(buf), "[%.4fM SF%u/%s] ", chan_freq / 1e6, sf, bwbuf);
+    else
+        snprintf(buf, sizeof(buf), "[SF%u/%s] ", sf, bwbuf);
     return buf;
+}
+
+// Parse a comma-separated list of integers ("7,8" / "869432000,869618000")
+static std::vector<long> parse_list(const char *s) {
+    std::vector<long> out;
+    while (*s) {
+        char *end;
+        long v = strtol(s, &end, 10);
+        if (end == s) break;
+        out.push_back(v);
+        s = (*end == ',') ? end + 1 : end;
+    }
+    return out;
 }
 
 int main(int argc, char *argv[]) {
     LoRaConfig cfg;
     const char *iq_file = nullptr;
     const char *dump_file = nullptr;
-    bool auto_mode = false, sf_given = false, bw_given = false;
+    bool auto_mode = false, freq_given = false, samp_given = false;
+    std::vector<long> sfs_cli, bws_cli, chans_cli;
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:p:IL:r:D:A")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:p:IL:r:D:AC:")) != -1) {
         switch (opt) {
-        case 'f': cfg.freq = (uint32_t)atol(optarg); break;
-        case 's': cfg.samp_rate = (uint32_t)atol(optarg); break;
-        case 'b': cfg.bw = (uint32_t)atol(optarg); bw_given = true; break;
-        case 'S': cfg.sf = (uint8_t)atoi(optarg); sf_given = true; break;
+        case 'f': cfg.freq = (uint32_t)atol(optarg); freq_given = true; break;
+        case 's': cfg.samp_rate = (uint32_t)atol(optarg); samp_given = true; break;
+        case 'b': bws_cli = parse_list(optarg); break;
+        case 'S': sfs_cli = parse_list(optarg); break;
         case 'c': cfg.cr = (uint8_t)atoi(optarg); break;
         case 'w': cfg.sync_word = (uint16_t)strtol(optarg, nullptr, 16); break;
         case 'g': cfg.gain = atoi(optarg); break;
@@ -1017,23 +1071,50 @@ int main(int argc, char *argv[]) {
         case 'r': iq_file = optarg; break;
         case 'D': dump_file = optarg; break;
         case 'A': auto_mode = true; break;
+        case 'C': chans_cli = parse_list(optarg); break;
         default:
-            fprintf(stderr, "Usage: %s [-f freq] [-s samp_rate] [-b bw] [-S sf] [-c cr] [-w sync_word_hex]\n"
-                            "          [-g gain] [-p ppm] [-I] [-L pay_len] [-A] [-r iq_file] [-D dump_file]\n", argv[0]);
+            fprintf(stderr, "Usage: %s [-f tuner_freq] [-s samp_rate] [-b bw[,bw..]] [-S sf[,sf..]] [-c cr]\n"
+                            "          [-w sync_word_hex] [-g gain] [-p ppm] [-I] [-L pay_len] [-A]\n"
+                            "          [-C chan_freq[,chan_freq..]] [-r iq_file] [-D dump_file]\n", argv[0]);
             return 1;
         }
     }
 
-    if (cfg.sf < MIN_SF || cfg.sf > MAX_SF) {
-        fprintf(stderr, "SF must be between %d and %d\n", MIN_SF, MAX_SF);
-        return 1;
+    for (long sf : sfs_cli) {
+        if (sf < MIN_SF || sf > MAX_SF) {
+            fprintf(stderr, "SF must be between %d and %d\n", MIN_SF, MAX_SF);
+            return 1;
+        }
     }
+    if (!sfs_cli.empty()) cfg.sf = (uint8_t)sfs_cli[0];
+    if (!bws_cli.empty()) cfg.bw = (uint32_t)bws_cli[0];
     if (cfg.cr < 1 || cfg.cr > 4) {
         uint8_t clamped = cfg.cr < 1 ? 1 : 4;
         fprintf(stderr, "Warning: CR %u out of range 1-4, using %u (explicit header overrides it anyway)\n",
                 cfg.cr, clamped);
         cfg.cr = clamped;
     }
+
+    // Channel list: default is a single channel at the tuner frequency
+    std::vector<uint32_t> channels;
+    for (long c : chans_cli) channels.push_back((uint32_t)c);
+    if (channels.empty()) channels = {cfg.freq};
+
+    // Multi-channel needs enough span; default to 1 MS/s unless -s was given
+    if (channels.size() > 1 && !samp_given)
+        cfg.samp_rate = 1000000;
+
+    // Tuner center: explicit -f wins; otherwise midpoint of the channels
+    // (which places the RTL-SDR DC spike between them, outside every channel)
+    uint32_t tuner_freq;
+    if (freq_given || chans_cli.empty()) {
+        tuner_freq = cfg.freq;
+    } else {
+        uint64_t lo = *std::min_element(channels.begin(), channels.end());
+        uint64_t hi = *std::max_element(channels.begin(), channels.end());
+        tuner_freq = (uint32_t)((lo + hi) / 2);
+    }
+
     if (cfg.samp_rate % cfg.bw != 0) {
         fprintf(stderr, "Warning: samp_rate should be an integer multiple of bandwidth\n");
     }
@@ -1042,34 +1123,68 @@ int main(int argc, char *argv[]) {
         g_u8lut[i] = ((float)i - 127.5f) / 127.5f;
 
     // Build the list of (SF, BW) decoder configurations
-    std::vector<uint8_t> sfs = {cfg.sf};
-    std::vector<uint32_t> bws = {cfg.bw};
-    if (auto_mode) {
-        if (!sf_given) sfs = {7, 8, 9, 10, 11, 12};
-        if (!bw_given) {
-            bws.clear();
+    std::vector<uint8_t> sfs;
+    for (long s : sfs_cli) sfs.push_back((uint8_t)s);
+    std::vector<uint32_t> bws;
+    for (long b : bws_cli) bws.push_back((uint32_t)b);
+    if (sfs.empty()) sfs = auto_mode ? std::vector<uint8_t>{7, 8, 9, 10, 11, 12} : std::vector<uint8_t>{cfg.sf};
+    if (bws.empty()) {
+        if (auto_mode) {
             for (uint32_t bw : {62500u, 125000u, 250000u, 500000u}) {
                 if (bw <= cfg.samp_rate && cfg.samp_rate % bw == 0 && cfg.samp_rate / bw <= 16)
                     bws.push_back(bw);
             }
-            if (bws.empty()) bws = {cfg.bw};
         }
+        if (bws.empty()) bws = {cfg.bw};
     }
 
-    bool multi = sfs.size() * bws.size() > 1;
-    for (uint32_t bw : bws) {
-        for (uint8_t sf : sfs) {
-            LoRaConfig c = cfg;
-            c.sf = sf;
-            c.bw = bw;
-            c.compute_derived();
-            g_workers.emplace_back(new DemodWorker(c, multi ? make_tag(sf, bw) : ""));
+    uint32_t max_bw = *std::max_element(bws.begin(), bws.end());
+    bool multi = channels.size() * sfs.size() * bws.size() > 1;
+    bool multi_chan = channels.size() > 1;
+
+    for (uint32_t chf : channels) {
+        double off = (double)chf - (double)tuner_freq;
+        if (fabs(off) + max_bw / 2.0 > 0.48 * cfg.samp_rate)
+            fprintf(stderr, "Warning: channel %u Hz (offset %+.0f Hz) is at/beyond the Nyquist edge for samp_rate %u\n",
+                    chf, off, cfg.samp_rate);
+
+        g_channels.push_back({});
+        ChannelFanout &ch = g_channels.back();
+        ch.freq = chf;
+        ch.identity = (off == 0.0);
+        ch.phase_inc = -2.0 * M_PI * off / (double)cfg.samp_rate;
+
+        for (uint32_t bw : bws) {
+            for (uint8_t sf : sfs) {
+                LoRaConfig c = cfg;
+                c.freq = chf;
+                c.sf = sf;
+                c.bw = bw;
+                c.compute_derived();
+                std::string tag, stag;
+                if (multi) {
+                    tag = make_tag(multi_chan ? chf : 0, sf, bw);
+                    char sbuf[64];
+                    snprintf(sbuf, sizeof(sbuf), "freq=%u sf=%u bw=%u", chf, sf, bw);
+                    stag = sbuf;
+                }
+                g_workers.emplace_back(new DemodWorker(c, tag, stag));
+                ch.workers.push_back(g_workers.back().get());
+            }
         }
     }
 
     cfg.compute_derived();
     fprintf(stderr, "LoRa Standalone RX\n");
-    fprintf(stderr, "  Freq:       %u Hz\n", cfg.freq);
+    if (multi_chan) {
+        fprintf(stderr, "  Tuner freq: %u Hz\n", tuner_freq);
+        fprintf(stderr, "  Channels:  ");
+        for (uint32_t chf : channels)
+            fprintf(stderr, " %u (%+.0f Hz)", chf, (double)chf - (double)tuner_freq);
+        fprintf(stderr, "\n");
+    } else {
+        fprintf(stderr, "  Freq:       %u Hz\n", tuner_freq);
+    }
     fprintf(stderr, "  Samp rate:  %u Hz\n", cfg.samp_rate);
     if (multi) {
         fprintf(stderr, "  Decoders:   %zu in parallel:", g_workers.size());
@@ -1132,7 +1247,7 @@ int main(int argc, char *argv[]) {
         g_dev = dev;
 
         rtlsdr_set_sample_rate(dev, cfg.samp_rate);
-        rtlsdr_set_center_freq(dev, cfg.freq);
+        rtlsdr_set_center_freq(dev, tuner_freq);
         rtlsdr_set_freq_correction(dev, cfg.ppm);
         rtlsdr_set_tuner_gain_mode(dev, 1); // manual gain
         rtlsdr_set_tuner_gain(dev, cfg.gain);
