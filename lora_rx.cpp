@@ -926,6 +926,10 @@ public:
         th = std::thread([this] { run(); });
     }
 
+    // Guard: a worker must never be destroyed with its thread still running,
+    // or teardown deadlocks (e.g. early error exits in main).
+    ~DemodWorker() { finish(); }
+
     void push(std::shared_ptr<const std::vector<cx>> chunk) {
         std::unique_lock<std::mutex> lk(mtx);
         cv_space.wait(lk, [&] { return q.size() < MAX_Q || stopping; });
@@ -980,6 +984,13 @@ private:
 
 static float g_u8lut[256];
 static std::vector<std::unique_ptr<DemodWorker>> g_workers;
+
+// Stop all workers and join their threads. Must run on every exit path once
+// workers exist, or the process hangs on the live threads during teardown.
+static void finish_workers() {
+    for (auto &w : g_workers)
+        w->finish();
+}
 static FILE *g_dump = nullptr;
 
 // One entry per RF channel: frequency-shifts the shared stream to put that
@@ -1230,6 +1241,7 @@ int main(int argc, char *argv[]) {
         g_dump = fopen(dump_file, "wb");
         if (!g_dump) {
             perror("dump file");
+            finish_workers();
             return 1;
         }
         fprintf(stderr, "Dumping raw IQ to %s\n", dump_file);
@@ -1243,6 +1255,7 @@ int main(int argc, char *argv[]) {
         FILE *f = strcmp(iq_file, "-") == 0 ? stdin : fopen(iq_file, "rb");
         if (!f) {
             perror("iq file");
+            finish_workers();
             return 1;
         }
         fprintf(stderr, "Replaying IQ from %s...\n\n", iq_file);
@@ -1259,12 +1272,14 @@ int main(int argc, char *argv[]) {
         int n_devices = rtlsdr_get_device_count();
         if (n_devices == 0) {
             fprintf(stderr, "No RTL-SDR devices found\n");
+            finish_workers();
             return 1;
         }
         fprintf(stderr, "Found %d RTL-SDR device(s)\n", n_devices);
 
         if (rtlsdr_open(&dev, dev_index) < 0) {
             fprintf(stderr, "Failed to open RTL-SDR device\n");
+            finish_workers();
             return 1;
         }
         g_dev = dev;
@@ -1290,8 +1305,7 @@ int main(int argc, char *argv[]) {
     }
 
     size_t total = 0;
-    for (auto &w : g_workers)
-        w->finish();
+    finish_workers();
     fprintf(stderr, "\nDone.\n");
     for (auto &w : g_workers) {
         total += w->packet_count();
