@@ -75,4 +75,24 @@ else
     FAIL=1
 fi
 
+# ---- lora_lite (embedded core, used by the PortaPack/Mayhem app) ----
+# Same synthesized frames, decoded by the no-malloc/no-thread static-buffer core.
+if command -v c++ >/dev/null 2>&1; then
+    lite_case() {
+        local desc="$1" sf="$2" os="$3" bin="$TMP/lite_$2_$3"
+        c++ -O2 -std=c++17 -DLORA_LITE_OS=$os -DLORA_LITE_MAX_SF=8 -I. -o "$bin" test_lite.cpp 2>/dev/null
+        ./lora_tx_gen -o "$TMP/l.iq" -S $sf -b 62500 -s $((62500*os)) -c 1 -m "LITE SF$sf" -N 0.02 2>/dev/null
+        if "$bin" "$TMP/l.iq" $sf $os 2>/dev/null | grep -q "^OK.*$(printf 'LITE SF%s' $sf | od -An -tx1 | tr -d ' \n')"; then
+            echo "PASS: lora_lite $desc"
+        else
+            echo "FAIL: lora_lite $desc"; FAIL=1
+        fi
+    }
+    lite_case "SF7 os2 (M4 default)" 7 2
+    lite_case "SF8 os2 (M4 default)" 8 2
+    lite_case "SF8 os4 (firmware config)" 8 4
+else
+    echo "SKIP: lora_lite (no host c++ compiler)"
+fi
+
 exit $FAIL
