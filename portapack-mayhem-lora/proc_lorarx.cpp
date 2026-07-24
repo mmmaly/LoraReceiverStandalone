@@ -46,6 +46,8 @@ void LoRaRxProcessor::execute(const buffer_c8_t& buffer) {
 void LoRaRxProcessor::packet_callback(const lora_lite::Packet& p, void* /*user*/) {
     auto& pd = *reinterpret_cast<LoRaPacketData*>(shared_memory.bb_data.data);
     pd.len = p.len;
+    pd.hdr_len = p.hdr_len;
+    pd.status = p.status;
     pd.crc_ok = p.crc_ok ? 1 : 0;
     pd.has_crc = p.has_crc ? 1 : 0;
     pd.sync = p.sync;
