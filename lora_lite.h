@@ -603,12 +603,17 @@ private:
     }
 
     // Nibble chase: retry the CRC substituting the runner-up nibble at the
-    // least-confident positions - singles then pairs of the 12 weakest, 78
-    // trials max (~1-2 ms on the M4, only ever runs on an already-lost frame).
+    // least-confident positions - singles and pairs of the 12 weakest plus
+    // triples of the 8 weakest (~134 CRC trials, a few ms on the M4, only
+    // ever runs on an already-lost frame). ALL patterns are tested; the
+    // frame is adopted only when EXACTLY ONE pattern passes. With multiple
+    // passers the 16-bit CRC cannot tell which is real, and a handheld UI
+    // showing a green "decoded" packet must not be reporting a coin flip.
     bool nibble_chase(uint8_t* bytes, int total) {
         const int n_nib = 2 * total;
-        constexpr int K = 12;
+        constexpr int K = 12, K3 = 8;
         int k = n_nib < K ? n_nib : K;
+        int k3 = k < K3 ? k : K3;
         int pos[K];
         for (int i = 0; i < k; i++) pos[i] = -1;
         for (int p = 0; p < n_nib; p++) {          // partial selection sort: k smallest margins
@@ -622,17 +627,36 @@ private:
         }
         uint8_t trial[NIB_CAP];
         memcpy(trial, nibbles_, n_nib);
-        for (int i = 0; i < k; i++) {
+        uint8_t found[LORA_LITE_MAX_PAYLOAD + 2];
+        int n_passed = 0;
+        uint8_t tb[LORA_LITE_MAX_PAYLOAD + 2];
+        auto test = [&]() {
+            build_bytes(trial, tb, total);
+            if (crc_ok(tb)) {
+                if (n_passed == 0) memcpy(found, tb, total);
+                n_passed++;
+            }
+        };
+        for (int i = 0; i < k && n_passed < 2; i++) {
             trial[pos[i]] = nib_alt_[pos[i]];
-            build_bytes(trial, bytes, total);
-            if (crc_ok(bytes)) return true;
-            for (int j = i + 1; j < k; j++) {
+            test();
+            for (int j = i + 1; j < k && n_passed < 2; j++) {
                 trial[pos[j]] = nib_alt_[pos[j]];
-                build_bytes(trial, bytes, total);
-                if (crc_ok(bytes)) return true;
+                test();
+                if (i < k3 && j < k3) {
+                    for (int c = j + 1; c < k3 && n_passed < 2; c++) {
+                        trial[pos[c]] = nib_alt_[pos[c]];
+                        test();
+                        trial[pos[c]] = nibbles_[pos[c]];
+                    }
+                }
                 trial[pos[j]] = nibbles_[pos[j]];
             }
             trial[pos[i]] = nibbles_[pos[i]];
+        }
+        if (n_passed == 1) {
+            memcpy(bytes, found, total);
+            return true;
         }
         return false;
     }
