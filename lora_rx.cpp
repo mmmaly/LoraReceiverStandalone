@@ -46,6 +46,7 @@
 #include <unordered_map>
 #include <string>
 #include <strings.h>
+#include <sys/time.h>
 #include <getopt.h>
 #include <rtl-sdr.h>
 
@@ -1492,8 +1493,17 @@ private:
         {
             std::lock_guard<std::mutex> lk(g_print_mtx);
 
-            if (!stdout_tag.empty())
-                printf("rx cfg: %s\n", stdout_tag.c_str());
+            // Wall-clock reception time (epoch seconds, ms precision) so
+            // offline log comparisons don't need to reconstruct timing from
+            // packet matching. Always printed: single-config runs get a
+            // bare "rx cfg: time=..." line. Downstream is unaffected - the
+            // dekoduj scripts grep "rx msg"/"rx ok" and meshcore-decoder
+            // stream passes unknown lines through.
+            struct timeval tv;
+            gettimeofday(&tv, nullptr);
+            printf("rx cfg: %s%stime=%ld.%03d\n",
+                   stdout_tag.c_str(), stdout_tag.empty() ? "" : " ",
+                   (long)tv.tv_sec, (int)(tv.tv_usec / 1000));
             printf("rx msg: ");
             for (uint32_t i = 0; i < m_pay_len; i++) {
                 if (i > 0) printf(", ");
