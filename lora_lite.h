@@ -50,15 +50,23 @@ static inline Cx cxconj(Cx a) { return {a.r, -a.i}; }
 static inline float cxnorm(Cx a) { return a.r * a.r + a.i * a.i; }
 static inline long lmod(long a, long b) { return ((a % b) + b) % b; }
 
-// Decoded packet handed to the caller.
+// Decoded packet (or detection) handed to the caller.
+enum PacketStatus : uint8_t {
+    PKT_HEADER_ONLY = 0,  // valid header decoded; payload not yet/never assembled
+    PKT_CRC_FAIL    = 1,  // full payload assembled but CRC failed
+    PKT_DECODED     = 2,  // full payload assembled, CRC valid (or no CRC)
+};
+
 struct Packet {
     uint8_t  data[LORA_LITE_MAX_PAYLOAD];
-    uint8_t  len;
+    uint8_t  len;         // payload bytes present in data[] (0 for header-only)
+    uint8_t  hdr_len;     // payload length declared by the header
+    uint8_t  status;      // PacketStatus
     bool     crc_ok;
     bool     has_crc;
     float    snr;
-    float    cfo;      // in bins
-    uint8_t  sync;     // detected sync word
+    float    cfo;         // in bins
+    uint8_t  sync;        // detected sync word
 };
 
 // ---- Hamming / whitening / CRC tables (shared with lora_rx) ----
@@ -324,10 +332,7 @@ private:
         }
         det_sync_ = det_sync;
 
-        // Per-symbol SFO drift rate (chips/symbol) from the TX/RX clock ratio.
-        // Applied incrementally in the payload loop; the larger one-shot
-        // m_sto_frac pre-load from gr-lora is omitted here as it interacts
-        // badly with lite's simpler preamble alignment (measured: fewer decodes).
+        // Per-symbol SFO drift rate; applied incrementally in the payload loop.
         sfo_hat_ = (float)(m_cfo_int_ + m_cfo_frac_) * (float)bw_ / (float)freq_;
         sfo_cum_ = 0;
 
@@ -512,9 +517,26 @@ private:
             // drop 5 header nibbles
             for (int i = 5; i < nib_n_; i++) nibbles_[i - 5] = nibbles_[i];
             nib_n_ -= 5;
+            // A valid header checksum + matching sync is a high-confidence real
+            // packet. Emit a detection now so the caller sees it even if the
+            // payload never fully assembles (weak signal fades before the end).
+            emit_detection();
         }
         uint32_t need = pay_len_ * 2 + (pay_crc_ ? 4 : 0);
         if (!is_header_ && (uint32_t)nib_n_ >= need) emit();
+    }
+
+    void emit_detection() {
+        Packet pkt{};
+        pkt.len = 0;
+        pkt.hdr_len = (uint8_t)pay_len_;
+        pkt.status = PKT_HEADER_ONLY;
+        pkt.has_crc = pay_crc_;
+        pkt.crc_ok = false;
+        pkt.snr = cur_snr_;
+        pkt.cfo = m_cfo_int_ + m_cfo_frac_;
+        pkt.sync = det_sync_;
+        if (cb_) cb_(pkt, user_);
     }
 
     void emit() {
@@ -536,6 +558,8 @@ private:
             uint16_t rx = bytes[pay_len_] | ((uint16_t)bytes[pay_len_ + 1] << 8);
             pkt.crc_ok = (calc == rx);
         }
+        pkt.hdr_len = (uint8_t)pay_len_;
+        pkt.status = pkt.crc_ok ? PKT_DECODED : PKT_CRC_FAIL;
         if (cb_) cb_(pkt, user_);
         nib_n_ = 0;
         reset();
