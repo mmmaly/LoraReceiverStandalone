@@ -194,14 +194,23 @@ private:
     static constexpr int N_UP_REQ = 5, UP_USE = 4, PREAMBLE_LEN = 8;
 
     // ---- payload decode state ----
+    static constexpr int NIB_CAP = 2 * (LORA_LITE_MAX_PAYLOAD + 2) + 16;
     int payload_sym_cnt_;
     uint32_t total_payload_symbols_;
     bool received_head_, ldro_, is_header_;
     int pay_cr_; uint32_t pay_len_; bool pay_crc_;
     float llr_block_[8][LORA_LITE_MAX_SF];
+    float llr_block_rot_[8][LORA_LITE_MAX_SF];
     int llr_block_n_;
-    uint8_t nibbles_[2 * (LORA_LITE_MAX_PAYLOAD + 2) + 16];
+    uint8_t nibbles_[NIB_CAP];
     int nib_n_;
+    // CRC-guided recovery state: shadow nibble stream decoded under a bin
+    // mapping rotated by the net-ID residual (integer CFO mis-split
+    // hypothesis), plus per-nibble runner-up + margin for the nibble chase.
+    int nid_resid_;
+    uint8_t nibbles_rot_[NIB_CAP];
+    uint8_t nib_alt_[NIB_CAP];
+    float nib_margin_[NIB_CAP];
 
     void reset() {
         state_ = DETECT; symbol_cnt_ = 1; bin_idx_ = 0; k_hat_ = 0;
@@ -210,7 +219,7 @@ private:
         net_ids_[0] = net_ids_[1] = 0;
         payload_sym_cnt_ = 0; total_payload_symbols_ = 0;
         received_head_ = false; ldro_ = false; is_header_ = true;
-        llr_block_n_ = 0; nib_n_ = 0;
+        llr_block_n_ = 0; nib_n_ = 0; nid_resid_ = 0;
     }
 
     void build_upchirp(Cx* out, uint32_t id) {
@@ -329,6 +338,12 @@ private:
             long d = lmod(nid0 - sync_words_[0], N_);
             long d2 = lmod(sync_words_[0] - nid0, N_);
             if ((d < d2 ? d : d2) > 2) { reset(); return sps_; }
+            // Signed net-ID residual: the first net-ID symbol is a KNOWN
+            // value, so its bin offset measures any constant shift the
+            // payload will suffer when the CFO int/frac split is off by a
+            // whole bin (the frac estimator wraps at +/-0.5). Used to decode
+            // a shadow nibble stream tried when the payload CRC fails.
+            nid_resid_ = (int)(d <= (long)N_ / 2 ? d : d - (long)N_);
         }
         det_sync_ = det_sync;
 
@@ -438,33 +453,46 @@ private:
 
     void demod_symbol(const Cx* sym) {
         int block = 4 + (is_header_ ? 4 : pay_cr_);
-        compute_llrs(sym, llr_block_[llr_block_n_]);
+        compute_llrs(sym, llr_block_[llr_block_n_],
+                     nid_resid_ ? llr_block_rot_[llr_block_n_] : nullptr);
         llr_block_n_++;
         if (llr_block_n_ == block) { decode_block(); llr_block_n_ = 0; }
     }
 
-    void compute_llrs(const Cx* sym, float* out) {
+    void compute_llrs(const Cx* sym, float* out, float* out_rot) {
         for (int i = 0; i < N_; i++) dech_[i] = cxmul(sym[i], demod_down_[i]);
         fftN(dech_, fout_, N_);
-        for (int i = 0; i < N_; i++) mag_[i] = cxnorm(fout_[i]);
+        // Amplitude (not power) bin metric: closer to the noncoherent LLR and
+        // avoids overweighting strong symbols inside a deinterleaved codeword.
+        for (int i = 0; i < N_; i++) mag_[i] = sqrtf(cxnorm(fout_[i]));
         const uint16_t* map = (is_header_ || ldro_) ? demap_hdr_ : demap_pay_;
         for (int i = 0; i < sf_; i++) {
-            float x1 = -1, x0 = -1;
+            float x1 = -1, x0 = -1, r1 = -1, r0 = -1;
             for (int n = 0; n < N_; n++) {
-                if (map[n] & (1u << i)) { if (mag_[n] > x1) x1 = mag_[n]; }
-                else { if (mag_[n] > x0) x0 = mag_[n]; }
+                bool one = map[n] & (1u << i);
+                float v = mag_[n];
+                if (one) { if (v > x1) x1 = v; }
+                else { if (v > x0) x0 = v; }
+                if (out_rot) {
+                    float vr = mag_[(n + nid_resid_ + N_) % N_];
+                    if (one) { if (vr > r1) r1 = vr; }
+                    else { if (vr > r0) r0 = vr; }
+                }
             }
-            out[sf_ - 1 - i] = (float)x1 - (float)x0;
+            out[sf_ - 1 - i] = x1 - x0;
+            if (out_rot) out_rot[sf_ - 1 - i] = r1 - r0;
         }
     }
 
-    // soft Hamming over the LLR codeword
+    // soft Hamming over the LLR codeword; optionally reports the runner-up
+    // data nibble and the best-vs-runner-up score margin (small = uncertain)
     static const uint8_t* cwlut();
-    uint8_t hamming_soft(const float* llr, int cr_app) {
+    uint8_t hamming_soft(const float* llr, int cr_app,
+                         uint8_t* alt = nullptr, float* margin = nullptr) {
         static const uint8_t LUT[16]     = {0,23,45,58,78,89,99,116,139,156,166,177,197,210,232,255};
         static const uint8_t LUT5[16]    = {0,24,40,48,72,80,96,120,136,144,160,184,192,216,232,240};
         int cw_len = cr_app + 4;
-        float best = -1e30; int bi = 0;
+        float best = -1e30f, best2 = -1e30f; int bi = 0, bi2 = 1;
         for (int n = 0; n < 16; n++) {
             float p = 0;
             for (int j = 0; j < cw_len; j++) {
@@ -472,10 +500,15 @@ private:
                 float a = llr[j] < 0 ? -llr[j] : llr[j];
                 if ((bit && llr[j] > 0) || (!bit && llr[j] < 0)) p += a; else p -= a;
             }
-            if (p > best) { best = p; bi = n; }
+            if (p > best) { best2 = best; bi2 = bi; best = p; bi = n; }
+            else if (p > best2) { best2 = p; bi2 = n; }
         }
-        uint8_t d = LUT[bi] >> 4;
-        return ((d & 1) << 3) | (((d >> 1) & 1) << 2) | (((d >> 2) & 1) << 1) | ((d >> 3) & 1);
+        auto to_nib = [](uint8_t d) -> uint8_t {
+            return ((d & 1) << 3) | (((d >> 1) & 1) << 2) | (((d >> 2) & 1) << 1) | ((d >> 3) & 1);
+        };
+        if (alt) *alt = to_nib(LUT[bi2] >> 4);
+        if (margin) *margin = best - best2;
+        return to_nib(LUT[bi] >> 4);
     }
 
     void decode_block() {
@@ -486,9 +519,19 @@ private:
         for (int i = 0; i < cw_len; i++)
             for (int j = 0; j < sf_app; j++)
                 deinter[lmod(i - j - 1, sf_app)][i] = llr_block_[i][sf_ - sf_app + j];
+        float deinter_rot[LORA_LITE_MAX_SF][8];
+        if (nid_resid_)
+            for (int i = 0; i < cw_len; i++)
+                for (int j = 0; j < sf_app; j++)
+                    deinter_rot[lmod(i - j - 1, sf_app)][i] = llr_block_rot_[i][sf_ - sf_app + j];
         for (int i = 0; i < sf_app; i++) {
-            if (nib_n_ < (int)sizeof(nibbles_))
-                nibbles_[nib_n_++] = hamming_soft(deinter[i], cr_app);
+            if (nib_n_ < NIB_CAP) {
+                nibbles_[nib_n_] = hamming_soft(deinter[i], cr_app,
+                                                &nib_alt_[nib_n_], &nib_margin_[nib_n_]);
+                nibbles_rot_[nib_n_] = nid_resid_
+                    ? hamming_soft(deinter_rot[i], cr_app) : nibbles_[nib_n_];
+                nib_n_++;
+            }
         }
         process_nibbles();
     }
@@ -514,8 +557,13 @@ private:
             int sf2 = sf_ - 2 * (ldro_ ? 1 : 0);
             total_payload_symbols_ = 8 + ((int)ceilf((2.0f * pay_len_ - sf_ + 2 + 5 + (pay_crc_ ? 4 : 0)) / sf2)) * (4 + pay_cr_);
             received_head_ = true; is_header_ = false;
-            // drop 5 header nibbles
-            for (int i = 5; i < nib_n_; i++) nibbles_[i - 5] = nibbles_[i];
+            // drop 5 header nibbles (all parallel streams stay aligned)
+            for (int i = 5; i < nib_n_; i++) {
+                nibbles_[i - 5] = nibbles_[i];
+                nibbles_rot_[i - 5] = nibbles_rot_[i];
+                nib_alt_[i - 5] = nib_alt_[i];
+                nib_margin_[i - 5] = nib_margin_[i];
+            }
             nib_n_ -= 5;
             // A valid header checksum + matching sync is a high-confidence real
             // packet. Emit a detection now so the caller sees it even if the
@@ -539,25 +587,80 @@ private:
         if (cb_) cb_(pkt, user_);
     }
 
+    void build_bytes(const uint8_t* nib, uint8_t* out, int total) const {
+        for (int i = 0; i < total; i++) {
+            uint8_t lo = nib[2 * i], hi = nib[2 * i + 1];
+            if ((uint32_t)i < pay_len_) { lo ^= WHITEN[i] & 0x0F; hi ^= (WHITEN[i] >> 4) & 0x0F; }
+            out[i] = (hi << 4) | lo;
+        }
+    }
+
+    bool crc_ok(const uint8_t* bytes) const {
+        uint16_t calc = crc16_ccitt(bytes, pay_len_ - 2);
+        calc ^= bytes[pay_len_ - 1] ^ ((uint16_t)bytes[pay_len_ - 2] << 8);
+        uint16_t rx = bytes[pay_len_] | ((uint16_t)bytes[pay_len_ + 1] << 8);
+        return calc == rx;
+    }
+
+    // Nibble chase: retry the CRC substituting the runner-up nibble at the
+    // least-confident positions - singles then pairs of the 12 weakest, 78
+    // trials max (~1-2 ms on the M4, only ever runs on an already-lost frame).
+    bool nibble_chase(uint8_t* bytes, int total) {
+        const int n_nib = 2 * total;
+        constexpr int K = 12;
+        int k = n_nib < K ? n_nib : K;
+        int pos[K];
+        for (int i = 0; i < k; i++) pos[i] = -1;
+        for (int p = 0; p < n_nib; p++) {          // partial selection sort: k smallest margins
+            for (int i = 0; i < k; i++) {
+                if (pos[i] < 0 || nib_margin_[p] < nib_margin_[pos[i]]) {
+                    for (int j = k - 1; j > i; j--) pos[j] = pos[j - 1];
+                    pos[i] = p;
+                    break;
+                }
+            }
+        }
+        uint8_t trial[NIB_CAP];
+        memcpy(trial, nibbles_, n_nib);
+        for (int i = 0; i < k; i++) {
+            trial[pos[i]] = nib_alt_[pos[i]];
+            build_bytes(trial, bytes, total);
+            if (crc_ok(bytes)) return true;
+            for (int j = i + 1; j < k; j++) {
+                trial[pos[j]] = nib_alt_[pos[j]];
+                build_bytes(trial, bytes, total);
+                if (crc_ok(bytes)) return true;
+                trial[pos[j]] = nibbles_[pos[j]];
+            }
+            trial[pos[i]] = nibbles_[pos[i]];
+        }
+        return false;
+    }
+
     void emit() {
         Packet pkt;
         int total = pay_len_ + (pay_crc_ ? 2 : 0);
         uint8_t bytes[LORA_LITE_MAX_PAYLOAD + 2];
-        for (int i = 0; i < total; i++) {
-            uint8_t lo = nibbles_[2 * i], hi = nibbles_[2 * i + 1];
-            if ((uint32_t)i < pay_len_) { lo ^= WHITEN[i] & 0x0F; hi ^= (WHITEN[i] >> 4) & 0x0F; }
-            bytes[i] = (hi << 4) | lo;
+        build_bytes(nibbles_, bytes, total);
+        pkt.crc_ok = true;
+        if (pay_crc_ && pay_len_ >= 2) {
+            pkt.crc_ok = crc_ok(bytes);
+            if (!pkt.crc_ok && nid_resid_) {
+                // rotation hypothesis: shadow stream decoded under the
+                // net-ID-residual bin shift
+                uint8_t rot_bytes[LORA_LITE_MAX_PAYLOAD + 2];
+                build_bytes(nibbles_rot_, rot_bytes, total);
+                if (crc_ok(rot_bytes)) {
+                    memcpy(bytes, rot_bytes, total);
+                    pkt.crc_ok = true;
+                }
+            }
+            if (!pkt.crc_ok && nibble_chase(bytes, total))
+                pkt.crc_ok = true;
         }
         for (uint32_t i = 0; i < pay_len_; i++) pkt.data[i] = bytes[i];
         pkt.len = pay_len_; pkt.has_crc = pay_crc_; pkt.snr = cur_snr_;
         pkt.cfo = m_cfo_int_ + m_cfo_frac_; pkt.sync = det_sync_;
-        pkt.crc_ok = true;
-        if (pay_crc_ && pay_len_ >= 2) {
-            uint16_t calc = crc16_ccitt(bytes, pay_len_ - 2);
-            calc ^= bytes[pay_len_ - 1] ^ ((uint16_t)bytes[pay_len_ - 2] << 8);
-            uint16_t rx = bytes[pay_len_] | ((uint16_t)bytes[pay_len_ + 1] << 8);
-            pkt.crc_ok = (calc == rx);
-        }
         pkt.hdr_len = (uint8_t)pay_len_;
         pkt.status = pkt.crc_ok ? PKT_DECODED : PKT_CRC_FAIL;
         if (cb_) cb_(pkt, user_);
