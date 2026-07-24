@@ -20,6 +20,11 @@
 
 #include <cstddef>
 
+// The demodulator (~63 KB of buffers) lives in static storage, not on the M4
+// heap. Placing it in .bss keeps the heap-allocated processor object tiny so
+// its construction can't fail for lack of heap.
+static lora_lite::Demod g_demod;
+
 void LoRaRxProcessor::execute(const buffer_c8_t& buffer) {
     if (!configured) return;
 
@@ -34,7 +39,7 @@ void LoRaRxProcessor::execute(const buffer_c8_t& buffer) {
         cx_buf[i].r = (float)decim_1_out.p[i].real() * (1.0f / 32768.0f);
         cx_buf[i].i = (float)decim_1_out.p[i].imag() * (1.0f / 32768.0f);
     }
-    demod.feed(cx_buf.data(), (int)(n < cx_buf.size() ? n : cx_buf.size()));
+    g_demod.feed(cx_buf.data(), (int)(n < cx_buf.size() ? n : cx_buf.size()));
 }
 
 void LoRaRxProcessor::packet_callback(const lora_lite::Packet& p, void* /*user*/) {
@@ -68,7 +73,7 @@ void LoRaRxProcessor::configure(const LoRaRxConfigureMessage& message) {
     decim_0.configure(taps_200k_wfm_decim_0.taps);
     decim_1.configure(taps_200k_wfm_decim_1.taps);
 
-    demod.init(message.sf, message.cr, message.has_crc != 0, message.sync_word,
+    g_demod.init(message.sf, message.cr, message.has_crc != 0, message.sync_word,
                &LoRaRxProcessor::packet_callback, this,
                message.bandwidth, 869618000);
 
