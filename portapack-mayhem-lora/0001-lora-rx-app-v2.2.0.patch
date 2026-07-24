@@ -1,0 +1,144 @@
+diff --git a/firmware/application/baseband_api.cpp b/firmware/application/baseband_api.cpp
+index 2655f37..580afeb 100644
+--- a/firmware/application/baseband_api.cpp
++++ b/firmware/application/baseband_api.cpp
+@@ -147,6 +147,11 @@ void set_sstv_data(const uint8_t vis_code, const uint32_t pixel_duration) {
+     send_message(&message);
+ }
+ 
++void set_lorarx(uint8_t sf, uint8_t cr, bool has_crc, uint16_t sync_word, uint32_t bandwidth) {
++    const LoRaRxConfigureMessage message{sf, cr, (uint8_t)(has_crc ? 1 : 0), sync_word, bandwidth};
++    send_message(&message);
++}
++
+ void set_afsk(const uint32_t baudrate, const uint32_t word_length, const uint32_t trigger_value, const bool trigger_word) {
+     const AFSKRxConfigureMessage message{
+         baudrate,
+diff --git a/firmware/application/baseband_api.hpp b/firmware/application/baseband_api.hpp
+index 84d5f29..86b8ead 100644
+--- a/firmware/application/baseband_api.hpp
++++ b/firmware/application/baseband_api.hpp
+@@ -80,6 +80,7 @@ void set_pitch_rssi(int32_t avg, bool enabled);
+ void set_afsk_data(const uint32_t afsk_samples_per_bit, const uint32_t afsk_phase_inc_mark, const uint32_t afsk_phase_inc_space, const uint8_t afsk_repeat, const uint32_t afsk_bw, const uint8_t symbol_count);
+ void kill_afsk();
+ void set_afsk(const uint32_t baudrate, const uint32_t word_length, const uint32_t trigger_value, const bool trigger_word);
++void set_lorarx(uint8_t sf, uint8_t cr, bool has_crc, uint16_t sync_word, uint32_t bandwidth);
+ void set_fsk(const uint32_t samplesPerSymbol, const uint32_t syncWord, const uint8_t syncWordLength, const uint32_t preamble, const uint8_t preambleLength, uint16_t numDataBytes);
+ void set_aprs(const uint32_t baudrate);
+ 
+diff --git a/firmware/application/external/external.cmake b/firmware/application/external/external.cmake
+index 8f8385f..fa56aae 100644
+--- a/firmware/application/external/external.cmake
++++ b/firmware/application/external/external.cmake
+@@ -1,6 +1,9 @@
+ set(EXTCPPSRC
+ 
+ 	#afsk_rx
++	external/lorarx/main.cpp
++	external/lorarx/ui_lorarx.cpp
++
+ 	external/afsk_rx/main.cpp
+ 	external/afsk_rx/ui_afsk_rx.cpp
+ 
+@@ -235,6 +238,7 @@ set(EXTCPPSRC
+ )
+ 
+ set(EXTAPPLIST
++	lorarx
+ 	afsk_rx
+ 	calculator
+ 	font_viewer
+diff --git a/firmware/application/external/external.ld b/firmware/application/external/external.ld
+index 1bc6c4b..581d5c3 100644
+--- a/firmware/application/external/external.ld
++++ b/firmware/application/external/external.ld
+@@ -79,6 +79,7 @@ MEMORY
+     ram_external_app_spaceinv   (rwx) : org = 0xADE60000, len = 32k
+     ram_external_app_blackjack  (rwx) : org = 0xADE70000, len = 32k
+     ram_external_app_battleship   (rwx) : org = 0xADE80000, len = 32k
++    ram_external_app_lorarx       (rwx) : org = 0xADE90000, len = 32k
+ }
+ 
+ SECTIONS
+@@ -419,5 +420,11 @@ SECTIONS
+         *(*ui*external_app*battleship*);
+     } > ram_external_app_battleship
+ 
++        .external_app_lorarx : ALIGN(4) SUBALIGN(4)
++    {
++        KEEP(*(.external_app.app_lorarx.application_information));
++        *(*ui*external_app*lorarx*);
++    } > ram_external_app_lorarx
++
+ }
+ 
+diff --git a/firmware/baseband/CMakeLists.txt b/firmware/baseband/CMakeLists.txt
+index d995932..8b3c63b 100644
+--- a/firmware/baseband/CMakeLists.txt
++++ b/firmware/baseband/CMakeLists.txt
+@@ -578,6 +578,13 @@ set(MODE_CPPSRC
+ )
+ DeclareTargets(PAFR afskrx)
+ 
++### LoRa RX
++set(MODE_CPPSRC
++	proc_lorarx.cpp
++)
++set_source_files_properties(proc_lorarx.cpp PROPERTIES COMPILE_OPTIONS "-Os")
++DeclareTargets(PLOR lorarx)
++
+ ### NRF RX
+ 
+ set(MODE_CPPSRC
+diff --git a/firmware/common/message.hpp b/firmware/common/message.hpp
+index 74427ae..0cf07c5 100644
+--- a/firmware/common/message.hpp
++++ b/firmware/common/message.hpp
+@@ -135,6 +135,8 @@ class Message {
+         NoaaAptRxStatusData = 78,
+         NoaaAptRxImageData = 79,
+         FSKPacket = 80,
++        LoRaRxConfigure = 81,
++        LoRaRxPacket = 82,
+         MAX
+     };
+ 
+@@ -146,6 +148,26 @@ class Message {
+     const ID id;
+ };
+ 
++// ---- LoRa RX (lora_lite core) ----
++class LoRaRxConfigureMessage : public Message {
++   public:
++    constexpr LoRaRxConfigureMessage(uint8_t sf, uint8_t cr, uint8_t has_crc, uint16_t sync_word, uint32_t bandwidth)
++        : Message{ID::LoRaRxConfigure}, sf{sf}, cr{cr}, has_crc{has_crc}, sync_word{sync_word}, bandwidth{bandwidth} {}
++    uint8_t sf; uint8_t cr; uint8_t has_crc; uint16_t sync_word; uint32_t bandwidth;
++};
++
++struct LoRaPacketData {
++    uint8_t data[64];
++    uint8_t len; uint8_t crc_ok; uint8_t has_crc; uint8_t sync;
++    float snr; float cfo;
++};
++
++class LoRaRxPacketMessage : public Message {
++   public:
++    constexpr LoRaRxPacketMessage(LoRaPacketData* packet) : Message{ID::LoRaRxPacket}, packet{packet} {}
++    LoRaPacketData* packet{nullptr};
++};
++
+ struct RSSIStatistics {
+     uint32_t accumulator{0};
+     uint8_t min{0};
+diff --git a/firmware/common/spi_image.hpp b/firmware/common/spi_image.hpp
+index cb6dc8c..b0474c4 100644
+--- a/firmware/common/spi_image.hpp
++++ b/firmware/common/spi_image.hpp
+@@ -115,6 +115,7 @@ constexpr image_tag_t image_tag_tones{'P', 'T', 'O', 'N'};
+ constexpr image_tag_t image_tag_flash_utility{'P', 'F', 'U', 'T'};
+ constexpr image_tag_t image_tag_usb_sd{'P', 'U', 'S', 'B'};
+ 
++constexpr image_tag_t image_tag_lorarx{'P', 'L', 'O', 'R'};
+ constexpr image_tag_t image_tag_weather{'P', 'W', 'T', 'H'};
+ constexpr image_tag_t image_tag_subghzd{'P', 'S', 'G', 'D'};
+ constexpr image_tag_t image_tag_protoview{'P', 'P', 'V', 'W'};
