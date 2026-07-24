@@ -1,5 +1,5 @@
 diff --git a/firmware/application/baseband_api.cpp b/firmware/application/baseband_api.cpp
-index 2655f37..580afeb 100644
+index 2655f37f..580afeb5 100644
 --- a/firmware/application/baseband_api.cpp
 +++ b/firmware/application/baseband_api.cpp
 @@ -147,6 +147,11 @@ void set_sstv_data(const uint8_t vis_code, const uint32_t pixel_duration) {
@@ -15,7 +15,7 @@ index 2655f37..580afeb 100644
      const AFSKRxConfigureMessage message{
          baudrate,
 diff --git a/firmware/application/baseband_api.hpp b/firmware/application/baseband_api.hpp
-index 84d5f29..86b8ead 100644
+index 84d5f292..86b8eadb 100644
 --- a/firmware/application/baseband_api.hpp
 +++ b/firmware/application/baseband_api.hpp
 @@ -80,6 +80,7 @@ void set_pitch_rssi(int32_t avg, bool enabled);
@@ -27,7 +27,7 @@ index 84d5f29..86b8ead 100644
  void set_aprs(const uint32_t baudrate);
  
 diff --git a/firmware/application/external/external.cmake b/firmware/application/external/external.cmake
-index 8f8385f..fa56aae 100644
+index 8f8385f6..fa56aae7 100644
 --- a/firmware/application/external/external.cmake
 +++ b/firmware/application/external/external.cmake
 @@ -1,6 +1,9 @@
@@ -49,7 +49,7 @@ index 8f8385f..fa56aae 100644
  	calculator
  	font_viewer
 diff --git a/firmware/application/external/external.ld b/firmware/application/external/external.ld
-index 1bc6c4b..581d5c3 100644
+index 1bc6c4be..581d5c3a 100644
 --- a/firmware/application/external/external.ld
 +++ b/firmware/application/external/external.ld
 @@ -79,6 +79,7 @@ MEMORY
@@ -73,7 +73,7 @@ index 1bc6c4b..581d5c3 100644
  }
  
 diff --git a/firmware/baseband/CMakeLists.txt b/firmware/baseband/CMakeLists.txt
-index d995932..8b3c63b 100644
+index d995932b..8b3c63bd 100644
 --- a/firmware/baseband/CMakeLists.txt
 +++ b/firmware/baseband/CMakeLists.txt
 @@ -578,6 +578,13 @@ set(MODE_CPPSRC
@@ -91,7 +91,7 @@ index d995932..8b3c63b 100644
  
  set(MODE_CPPSRC
 diff --git a/firmware/common/message.hpp b/firmware/common/message.hpp
-index 74427ae..0cf07c5 100644
+index 74427ae5..8f5a51a4 100644
 --- a/firmware/common/message.hpp
 +++ b/firmware/common/message.hpp
 @@ -135,6 +135,8 @@ class Message {
@@ -103,7 +103,7 @@ index 74427ae..0cf07c5 100644
          MAX
      };
  
-@@ -146,6 +148,26 @@ class Message {
+@@ -146,6 +148,27 @@ class Message {
      const ID id;
  };
  
@@ -118,6 +118,7 @@ index 74427ae..0cf07c5 100644
 +struct LoRaPacketData {
 +    uint8_t data[64];
 +    uint8_t len; uint8_t crc_ok; uint8_t has_crc; uint8_t sync;
++    uint8_t hdr_len; uint8_t status;  // lora_lite PacketStatus: 0=hdr-only 1=crc-fail 2=decoded
 +    float snr; float cfo;
 +};
 +
@@ -131,7 +132,7 @@ index 74427ae..0cf07c5 100644
      uint32_t accumulator{0};
      uint8_t min{0};
 diff --git a/firmware/common/spi_image.hpp b/firmware/common/spi_image.hpp
-index cb6dc8c..b0474c4 100644
+index cb6dc8c6..b0474c49 100644
 --- a/firmware/common/spi_image.hpp
 +++ b/firmware/common/spi_image.hpp
 @@ -115,6 +115,7 @@ constexpr image_tag_t image_tag_tones{'P', 'T', 'O', 'N'};
