@@ -178,6 +178,7 @@ struct LoRaConfig {
     uint32_t pay_len        = 11;
     int      gain           = 490;  // in 0.1 dB
     bool     rtl_agc        = false; // RTL2832 internal digital AGC
+    bool     tuner_agc      = false; // R820T analog tuner AGC (instead of manual gain)
     int      ppm            = -3;
     uint16_t preamble_len   = 8;
     bool     soft_decoding  = true;
@@ -1708,7 +1709,7 @@ int main(int argc, char *argv[]) {
     std::vector<long> sfs_cli, bws_cli, chans_cli;
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:Gp:IL:r:D:AC:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:")) != -1) {
         switch (opt) {
         case 'f': cfg.freq = (uint32_t)atol(optarg); freq_given = true; break;
         case 's': cfg.samp_rate = (uint32_t)atol(optarg); samp_given = true; break;
@@ -1718,6 +1719,7 @@ int main(int argc, char *argv[]) {
         case 'w': cfg.sync_word = (uint16_t)strtol(optarg, nullptr, 16); break;
         case 'g': cfg.gain = atoi(optarg); break;
         case 'G': cfg.rtl_agc = true; break;
+        case 'T': cfg.tuner_agc = true; break;
         case 'p': cfg.ppm = atoi(optarg); break;
         case 'I': cfg.impl_head = true; break;
         case 'L': cfg.pay_len = (uint32_t)atoi(optarg); break;
@@ -1729,7 +1731,8 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Usage: %s [-f tuner_freq] [-s samp_rate] [-b bw[,bw..]] [-S sf[,sf..]] [-c cr]\n"
                             "          [-w sync_word_hex] [-g gain] [-G] [-p ppm] [-I] [-L pay_len] [-A]\n"
                             "          [-C chan_freq[,chan_freq..]] [-r iq_file] [-D dump_file]\n"
-                            "  -G enables the RTL2832 internal digital AGC\n", argv[0]);
+                            "  -G enables the RTL2832 internal digital AGC\n"
+                            "  -T enables the R820T analog tuner AGC (overrides -g)\n", argv[0]);
             return 1;
         }
     }
@@ -1907,8 +1910,12 @@ int main(int argc, char *argv[]) {
         rtlsdr_set_sample_rate(dev, cfg.samp_rate);
         rtlsdr_set_center_freq(dev, tuner_freq);
         rtlsdr_set_freq_correction(dev, cfg.ppm);
-        rtlsdr_set_tuner_gain_mode(dev, 1); // manual gain
-        rtlsdr_set_tuner_gain(dev, cfg.gain);
+        if (cfg.tuner_agc) {
+            rtlsdr_set_tuner_gain_mode(dev, 0); // analog tuner AGC
+        } else {
+            rtlsdr_set_tuner_gain_mode(dev, 1); // manual gain
+            rtlsdr_set_tuner_gain(dev, cfg.gain);
+        }
         // RTL2832 internal digital AGC: scales a weak analog signal up to use
         // the 8-bit ADC range. Essential when the tuner output is so low that
         // the baseband RMS is only a couple of LSB (-G to enable).
