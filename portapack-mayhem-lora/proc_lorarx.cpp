@@ -17,6 +17,7 @@
 #include "proc_lorarx.hpp"
 #include "portapack_shared_memory.hpp"
 #include "event_m4.hpp"
+#include "audio_dma.hpp"
 
 #include <cstddef>
 
@@ -81,6 +82,10 @@ void LoRaRxProcessor::configure(const LoRaRxConfigureMessage& message) {
 }
 
 int main() {
+    // Required baseband infrastructure init, as every stock proc does. Omitting
+    // this leaves the M4 unable to signal ready -> the M0 reports Baseband Sync Fail.
+    audio::dma::init_audio_out();
+
     EventDispatcher event_dispatcher{std::make_unique<LoRaRxProcessor>()};
     event_dispatcher.run();
     return 0;
