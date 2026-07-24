@@ -3,14 +3,25 @@
 This records the exact, reproducible recipe used to build a flashable Mayhem
 firmware image with the LoRa RX app, on macOS (Apple Silicon), **without Docker**.
 
-## Result artifacts
+## IMPORTANT: match your device's flash size
 
-- `portapack-mayhem-firmware.bin` (2 MB) — full firmware image to flash.
-- `lorarx.ppma` (~32 KB) — the LoRa app as a standalone SD-card app that
-  bundles its own M4 baseband image (loadable without reflashing, on a
-  compatible firmware).
+A **stock HackRF One has 1 MB of SPI flash**. Mayhem `master`/v2.4.0 is a **2 MB**
+build and will NOT flash on it — the on-device Flash Utility rejects any file
+larger than the flash ("BAD FIRMWARE FILE OR W/R ERR"). The target device here
+runs **v2.2.0 on 1 MB flash**, so the deliverable is a **1 MB v2.2.0 image**:
 
-Built against Mayhem `master` (version v2.4.0), external-app framework.
+- `portapack-mayhem_v2.2.0_LORA.bin` (exactly 1 MB, checksum-valid) — flash this.
+- Patch: `0001-lora-rx-app-v2.2.0.patch` (against the `v2.2.0` tag).
+
+If your device has 2 MB+ flash, the master build (`0001-lora-rx-app.patch`,
+`-DFLASH_MB_SIZE=2 -DFLASH_MB_LIMIT_SIZE=2`) also works and keeps all stock apps.
+
+### The gotcha that made the 1 MB build fit
+
+Do **NOT** pass `-DCMAKE_BUILD_TYPE=Release`. Mayhem's app is compiled `-Os`
+(`USE_OPT`), but `Release` appends `-O3 -DNDEBUG` which *overrides* `-Os` and
+bloats the M0 app by ~66 KB — enough to overflow 1 MB. Configure with a bare
+`cmake ..` (no build type).
 
 ## Toolchain (all no-sudo, downloaded to a scratch dir)
 
