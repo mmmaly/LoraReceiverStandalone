@@ -52,7 +52,9 @@ class LoRaRxProcessor : public BasebandProcessor {
     // Scratch for the float conversion handed to the core.
     std::array<lora_lite::Cx, 256> cx_buf{};
 
-    lora_lite::Demod demod{};
+    // NB: the ~63 KB lora_lite::Demod is NOT a member. This processor is
+    // heap-allocated (make_unique) and the M4 heap can't hold 63 KB, so the
+    // demod lives in static storage (.bss) instead. See proc_lorarx.cpp.
 
     BasebandThread baseband_thread{baseband_fs, this, baseband::Direction::Receive};
     RSSIThread rssi_thread{};
