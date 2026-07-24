@@ -67,20 +67,29 @@ void LoRaRxView::configure_baseband() {
 }
 
 void LoRaRxView::on_packet(const LoRaPacketData& pkt) {
+    // status: 0=header-only detection, 1=crc-fail, 2=decoded
     packet_count++;
+    if (pkt.status == 2) decoded_count++;
 
-    // Console colour: ESC followed by a palette index (see afsk_rx). 11=green,
-    // 9=red for CRC ok / bad.
+    // Colour: green=decoded, yellow=detected/crc-fail (a real packet whose
+    // payload didn't fully decode - common on a weak HackRF front end).
+    // ESC + palette index (11=green, 10=yellow, 9=red).
+    char col = (pkt.status == 2) ? 11 : 10;
     std::string line = "\x1B";
-    line += (char)(pkt.crc_ok ? 11 : 9);
+    line += col;
     line += to_string_dec_uint(packet_count) + ": ";
-    for (uint8_t i = 0; i < pkt.len; i++)
-        line += to_string_hex(pkt.data[i], 2);
+    if (pkt.status == 2) {
+        for (uint8_t i = 0; i < pkt.len; i++) line += to_string_hex(pkt.data[i], 2);
+    } else if (pkt.status == 1) {
+        line += "CRC-FAIL len=" + to_string_dec_uint(pkt.hdr_len);
+    } else {
+        line += "DETECTED len=" + to_string_dec_uint(pkt.hdr_len);
+    }
     console.writeln(line);
 
     std::string info = "  SNR " + to_string_dec_int((int)pkt.snr) +
                        " sync " + to_string_hex(pkt.sync, 2) +
-                       (pkt.crc_ok ? " CRC ok" : " CRC BAD");
+                       " ok=" + to_string_dec_uint(decoded_count);
     console.writeln(info);
 }
 
