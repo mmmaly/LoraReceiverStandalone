@@ -89,7 +89,11 @@ static int most_frequent(const int *arr, int n) {
 // Hamming Decoder (soft + hard)
 // ============================================================================
 
-static uint8_t hamming_decode_soft(const double *codeword_LLR, int cr_app) {
+// Soft-decision Hamming decode. Optionally reports the runner-up data nibble
+// and the score margin between best and runner-up (small margin = uncertain
+// decision), which feeds the CRC-guided chase recovery on failed payloads.
+static uint8_t hamming_decode_soft(const double *codeword_LLR, int cr_app,
+                                   uint8_t *alt_nibble = nullptr, double *margin = nullptr) {
     int cw_len = cr_app + 4;
     double cw_proba[16] = {};
     for (int n = 0; n < 16; n++) {
@@ -102,9 +106,21 @@ static uint8_t hamming_decode_soft(const double *codeword_LLR, int cr_app) {
         }
     }
     int idx_max = (int)(std::max_element(cw_proba, cw_proba + 16) - cw_proba);
-    uint8_t data = cw_LUT[idx_max] >> 4;
-    // reverse bit order
-    return ((data & 1) << 3) | (((data >> 1) & 1) << 2) | (((data >> 2) & 1) << 1) | ((data >> 3) & 1);
+    auto to_nibble = [](uint8_t data) -> uint8_t {
+        // reverse bit order
+        return ((data & 1) << 3) | (((data >> 1) & 1) << 2) | (((data >> 2) & 1) << 1) | ((data >> 3) & 1);
+    };
+    if (alt_nibble || margin) {
+        double best2 = -1e300;
+        int idx2 = (idx_max + 1) & 15;
+        for (int n = 0; n < 16; n++) {
+            if (n == idx_max) continue;
+            if (cw_proba[n] > best2) { best2 = cw_proba[n]; idx2 = n; }
+        }
+        if (alt_nibble) *alt_nibble = to_nibble(cw_LUT[idx2] >> 4);
+        if (margin) *margin = cw_proba[idx_max] - best2;
+    }
+    return to_nibble(cw_LUT[idx_max] >> 4);
 }
 
 static uint8_t hamming_decode_hard(uint8_t cw_byte, int cr_app) {
@@ -423,11 +439,21 @@ public:
 
                     items_to_consume = sps / 4 + (long)os * m_cfo_int;
                     if (items_to_consume < 0) items_to_consume = 0;
+                    // Remember where the frame's symbols start (and the SFO
+                    // accumulator state) so a failed frame can be re-run at
+                    // shifted timing from the retained ring samples.
+                    frame_start_abs = ring_abs0 + head + (size_t)items_to_consume;
+                    frame_sfo_cum0 = sfo_cum;
 
                     {
+                        // Signed residual of the first net-ID symbol from its
+                        // nominal sync bin: a known-symbol measurement of any
+                        // constant bin offset the payload will suffer.
+                        long dpos = mod(nid[0] - cfg.sync_words[0], N);
+                        long nid_resid = dpos <= (long)N / 2 ? dpos : dpos - (long)N;
                         std::lock_guard<std::mutex> lk(g_print_mtx);
-                        fprintf(stderr, "%s[sync] Frame #%u detected, CFO=%.2f, sync=0x%02X, SNR=%.1f dB\n",
-                                tag.c_str(), frame_cnt, m_cfo_int + m_cfo_frac, det_sync, snr_e);
+                        fprintf(stderr, "%s[sync] Frame #%u detected, CFO=%.2f, sync=0x%02X, SNR=%.1f dB, nid_resid=%+ld\n",
+                                tag.c_str(), frame_cnt, m_cfo_int + m_cfo_frac, det_sync, snr_e, nid_resid);
                     }
                     break;
                 }
@@ -499,6 +525,8 @@ private:
     // Incoming sample buffer: consumed by advancing `head`, compacted rarely
     std::vector<cx> ring;
     size_t head = 0;
+    size_t ring_abs0 = 0;        // absolute sample index of ring[0]
+    size_t frame_start_abs = 0;  // absolute index of first payload-window sample
 
     size_t avail() const { return ring.size() - head; }
 
@@ -506,8 +534,17 @@ private:
         if (head > (size_t)(1 << 17)) {
             // Keep fir_delay samples of history before head for the FIR
             size_t drop = head - fir_delay;
+            // While decoding a frame, keep everything from a symbol before its
+            // start so a failed frame can be re-demodulated at shifted timing
+            if (state == PAYLOAD) {
+                long keep_from = (long)(frame_start_abs - ring_abs0) - (long)sps - fir_delay;
+                if (keep_from < 0) keep_from = 0;
+                if ((size_t)keep_from < drop) drop = (size_t)keep_from;
+            }
+            if (drop == 0) return;
             ring.erase(ring.begin(), ring.begin() + drop);
-            head = fir_delay;
+            head -= drop;
+            ring_abs0 += drop;
         }
     }
 
@@ -522,6 +559,22 @@ private:
         for (int k = k0; k < T; k++)
             acc += fir_taps[k] * ring[base + k];
         return acc;
+    }
+
+    // Same, addressed by absolute sample index; false if outside the ring.
+    inline bool sample_at_abs(long abs_idx, cx &out) const {
+        long rel = abs_idx - (long)ring_abs0;
+        if (rel < 0 || (size_t)rel >= ring.size()) return false;
+        if (fir_taps.empty()) { out = ring[rel]; return true; }
+        long base = rel - fir_delay;
+        const int T = (int)fir_taps.size();
+        if (base + T > (long)ring.size()) return false;
+        int k0 = base < 0 ? (int)(-base) : 0;
+        cx acc(0, 0);
+        for (int k = k0; k < T; k++)
+            acc += fir_taps[k] * ring[base + k];
+        out = acc;
+        return true;
     }
 
     inline void fft_N(const cx *in, cx *out) {
@@ -555,6 +608,7 @@ private:
     int down_val;
     unsigned int frame_cnt = 0;
     float current_snr;
+    float frame_sfo_cum0 = 0;
 
     // Payload demod state
     int payload_symbol_cnt;
@@ -570,6 +624,19 @@ private:
     std::vector<std::array<double, MAX_SF>> fft_block; // LLR blocks for soft decoding
     std::vector<uint16_t> hard_block;                  // symbol values for hard decoding
     std::vector<uint8_t> nibbles;                      // decoded nibbles
+    std::vector<uint8_t> nib_alt;                      // runner-up nibble per position
+    std::vector<double> nib_margin;                    // decision margin per position
+
+    // Per-block raw FFT magnitudes of the payload symbols, kept for the
+    // symbol-level chase: one corrupted symbol (collision burst) damages up to
+    // sf_app nibbles at once, a pattern the nibble-level chase cannot reach.
+    struct BlockRec {
+        int nib_start;                        // first nibble index this block produced
+        int cw_len, sf_app, cr_app;
+        std::vector<std::vector<float>> mags; // cw_len entries of N bin magnitudes
+    };
+    std::vector<BlockRec> block_recs;
+    std::vector<std::vector<float>> pending_mags;      // symbols of the block in progress
 
     void reset_state() {
         state = DETECT;
@@ -593,6 +660,10 @@ private:
         fft_block.clear();
         hard_block.clear();
         nibbles.clear();
+        nib_alt.clear();
+        nib_margin.clear();
+        block_recs.clear();
+        pending_mags.clear();
     }
 
     // Dechirp + FFT, return argmax bin
@@ -678,6 +749,8 @@ private:
 
         if (cfg.soft_decoding) {
             fft_block.push_back(compute_LLRs(symbol));
+            if (!is_header)  // keep raw bin magnitudes for the symbol-level chase
+                pending_mags.emplace_back(fft_mag.begin(), fft_mag.begin() + N);
             if ((int)fft_block.size() == block_size) {
                 decode_block_soft();
                 fft_block.clear();
@@ -695,21 +768,32 @@ private:
 
     // ---- Compute LLRs for one symbol (soft demod, max-log approximation) ----
     std::array<double, MAX_SF> compute_LLRs(const cx *samples) {
+        return compute_LLRs_map(samples, is_header || m_ldro);
+    }
+
+    // rot: constant bin rotation applied when reading the spectrum - a symbol
+    // window shifted by k chips lands every dechirped peak k bins away, so a
+    // retimed decode must read the constellation counter-rotated.
+    std::array<double, MAX_SF> compute_LLRs_map(const cx *samples, bool hdr_map, int rot = 0) {
         cx_multiply(dechirp_buf.data(), samples, demod_downchirp.data(), N);
         fft_N(dechirp_buf.data(), fft_out.data());
+        // Amplitude (not power) bin metric: for noncoherent detection the LLR
+        // grows ~linearly with amplitude, and power scaling overweights strong
+        // symbols against weak ones inside a deinterleaved codeword.
         for (uint32_t i = 0; i < N; i++)
-            fft_mag[i] = std::norm(fft_out[i]);
+            fft_mag[i] = sqrtf(std::norm(fft_out[i]));
 
-        const uint16_t *map = (is_header || m_ldro) ? demap_hdr.data() : demap_pay.data();
+        const uint16_t *map = hdr_map ? demap_hdr.data() : demap_pay.data();
 
         std::array<double, MAX_SF> LLRs{};
         for (uint32_t i = 0; i < cfg.sf; i++) {
             float max_X1 = -1, max_X0 = -1;
             for (uint32_t n = 0; n < N; n++) {
+                float v = fft_mag[(n + (uint32_t)(rot + (int)N)) % N];
                 if (map[n] & (1u << i)) {
-                    if (fft_mag[n] > max_X1) max_X1 = fft_mag[n];
+                    if (v > max_X1) max_X1 = v;
                 } else {
-                    if (fft_mag[n] > max_X0) max_X0 = fft_mag[n];
+                    if (v > max_X0) max_X0 = v;
                 }
             }
             LLRs[cfg.sf - 1 - i] = (double)max_X1 - (double)max_X0;
@@ -729,9 +813,26 @@ private:
             for (int j = 0; j < sf_app; j++)
                 deinter[mod(i - j - 1, sf_app)][i] = fft_block[i][cfg.sf - sf_app + j];
 
-        // Hamming decode each codeword
-        for (int i = 0; i < sf_app; i++)
-            nibbles.push_back(hamming_decode_soft(deinter[i], cr_app));
+        // Hamming decode each codeword, keeping the runner-up + margin for
+        // possible CRC-guided recovery later
+        for (int i = 0; i < sf_app; i++) {
+            uint8_t alt;
+            double mg;
+            nibbles.push_back(hamming_decode_soft(deinter[i], cr_app, &alt, &mg));
+            nib_alt.push_back(alt);
+            nib_margin.push_back(mg);
+        }
+
+        if (!is_header && (int)pending_mags.size() == cw_len) {
+            BlockRec rec;
+            rec.nib_start = (int)nibbles.size() - sf_app;
+            rec.cw_len = cw_len;
+            rec.sf_app = sf_app;
+            rec.cr_app = cr_app;
+            rec.mags = std::move(pending_mags);
+            block_recs.push_back(std::move(rec));
+        }
+        pending_mags.clear();
 
         process_nibbles();
     }
@@ -752,14 +853,38 @@ private:
             for (int j = 0; j < cw_len; j++)
                 cw_byte = (cw_byte << 1) | deinter[i][j];
             nibbles.push_back(hamming_decode_hard(cw_byte, cr_app));
+            // no soft info in the hard path: mark as fully confident
+            nib_alt.push_back(nibbles.back());
+            nib_margin.push_back(1e300);
         }
 
         process_nibbles();
     }
 
+    // Header checksum over the first 5 nibbles (5-bit result).
+    static int header_checksum(const uint8_t *n) {
+        bool c4 = ((n[0] >> 3) & 1) ^ ((n[0] >> 2) & 1) ^ ((n[0] >> 1) & 1) ^ (n[0] & 1);
+        bool c3 = ((n[0] >> 3) & 1) ^ ((n[1] >> 3) & 1) ^ ((n[1] >> 2) & 1) ^ ((n[1] >> 1) & 1) ^ (n[2] & 1);
+        bool c2 = ((n[0] >> 2) & 1) ^ ((n[1] >> 3) & 1) ^ (n[1] & 1) ^ ((n[2] >> 3) & 1) ^ ((n[2] >> 1) & 1);
+        bool c1 = ((n[0] >> 1) & 1) ^ ((n[1] >> 2) & 1) ^ (n[1] & 1) ^ ((n[2] >> 2) & 1) ^ ((n[2] >> 1) & 1) ^ (n[2] & 1);
+        bool c0 = (n[0] & 1) ^ ((n[1] >> 1) & 1) ^ ((n[2] >> 3) & 1) ^ ((n[2] >> 2) & 1) ^ ((n[2] >> 1) & 1) ^ (n[2] & 1);
+        return (c4 << 4) | (c3 << 3) | (c2 << 2) | (c1 << 1) | c0;
+    }
+
+    static bool header_consistent(const uint8_t *n) {
+        uint8_t chk = ((n[3] & 1) << 4) | n[4];
+        uint32_t len = (n[0] << 4) | n[1];
+        return header_checksum(n) == chk && len != 0;
+    }
+
     // ---- Process accumulated nibbles (header decode / payload assembly) ----
     void process_nibbles() {
         if (is_header && nibbles.size() >= 5 && !cfg.impl_head) {
+            // (Header chase recovery was tried here and removed: with only a
+            // 5-bit checksum it accepts bogus headers, and a phantom payload
+            // deafens the receiver to following real frames - measured net
+            // negative on real captures.)
+
             // Decode explicit header
             m_pay_len = (nibbles[0] << 4) | nibbles[1];
             m_pay_has_crc = nibbles[2] & 1;
@@ -769,15 +894,7 @@ private:
             if (m_pay_cr > 4) m_pay_cr = 4;
 
             uint8_t header_chk = ((nibbles[3] & 1) << 4) | nibbles[4];
-
-            // Verify header checksum
-            bool c4 = ((nibbles[0] >> 3) & 1) ^ ((nibbles[0] >> 2) & 1) ^ ((nibbles[0] >> 1) & 1) ^ (nibbles[0] & 1);
-            bool c3 = ((nibbles[0] >> 3) & 1) ^ ((nibbles[1] >> 3) & 1) ^ ((nibbles[1] >> 2) & 1) ^ ((nibbles[1] >> 1) & 1) ^ (nibbles[2] & 1);
-            bool c2 = ((nibbles[0] >> 2) & 1) ^ ((nibbles[1] >> 3) & 1) ^ (nibbles[1] & 1) ^ ((nibbles[2] >> 3) & 1) ^ ((nibbles[2] >> 1) & 1);
-            bool c1 = ((nibbles[0] >> 1) & 1) ^ ((nibbles[1] >> 2) & 1) ^ (nibbles[1] & 1) ^ ((nibbles[2] >> 2) & 1) ^ ((nibbles[2] >> 1) & 1) ^ (nibbles[2] & 1);
-            bool c0 = (nibbles[0] & 1) ^ ((nibbles[1] >> 1) & 1) ^ ((nibbles[2] >> 3) & 1) ^ ((nibbles[2] >> 2) & 1) ^ ((nibbles[2] >> 1) & 1) ^ (nibbles[2] & 1);
-
-            int computed_chk = (c4 << 4) | (c3 << 3) | (c2 << 2) | (c1 << 1) | c0;
+            int computed_chk = header_checksum(nibbles.data());
 
             {
                 std::lock_guard<std::mutex> lk(g_print_mtx);
@@ -808,6 +925,8 @@ private:
 
             // Remove header nibbles, keep remaining payload nibbles
             nibbles.erase(nibbles.begin(), nibbles.begin() + 5);
+            nib_alt.erase(nib_alt.begin(), nib_alt.begin() + 5);
+            nib_margin.erase(nib_margin.begin(), nib_margin.begin() + 5);
 
         } else if (is_header && cfg.impl_head) {
             // Implicit header - parameters from config
@@ -826,38 +945,535 @@ private:
     }
 
     // ---- Dewhiten + CRC check + output ----
-    void assemble_and_output() {
-        uint32_t total_bytes = m_pay_len + (m_pay_has_crc ? 2 : 0);
-        std::vector<uint8_t> bytes(total_bytes);
 
+    // Build dewhitened bytes from a nibble sequence (payload + CRC trailer).
+    void nibbles_to_bytes(const uint8_t *nib, uint8_t *out, uint32_t total_bytes) const {
         for (uint32_t i = 0; i < total_bytes; i++) {
-            uint8_t low_nib = nibbles[2 * i];
-            uint8_t high_nib = nibbles[2 * i + 1];
-
+            uint8_t low_nib = nib[2 * i];
+            uint8_t high_nib = nib[2 * i + 1];
             if (i < m_pay_len) {
-                // Dewhiten payload
+                // Dewhiten payload; CRC bytes are NOT dewhitened
                 low_nib ^= (whitening_seq[i] & 0x0F);
                 high_nib ^= (whitening_seq[i] >> 4) & 0x0F;
             }
-            // CRC bytes are NOT dewhitened
-
-            bytes[i] = (high_nib << 4) | low_nib;
+            out[i] = (high_nib << 4) | low_nib;
         }
+    }
+
+    bool payload_crc_ok(const uint8_t *bytes) const {
+        uint16_t calc_crc = crc16(bytes, m_pay_len - 2);
+        calc_crc = calc_crc ^ bytes[m_pay_len - 1] ^ ((uint16_t)bytes[m_pay_len - 2] << 8);
+        uint16_t rx_crc = bytes[m_pay_len] | ((uint16_t)bytes[m_pay_len + 1] << 8);
+        return calc_crc == rx_crc;
+    }
+
+    // CRC-guided chase recovery: retry the CRC with the runner-up Hamming
+    // codeword substituted at the least-confident nibble positions, testing
+    // candidate error patterns in order of increasing implausibility (sum of
+    // decision margins). Returns the number of substituted nibbles, 0 if no
+    // pattern passed.
+    int chase_recover(std::vector<uint8_t> &bytes, uint32_t total_bytes) {
+        const uint32_t n_nib = 2 * total_bytes;
+        if (nib_margin.size() < n_nib || nib_alt.size() < n_nib) return 0;
+
+        // k least-confident positions
+        constexpr int CHASE_K = 16;         // positions considered
+        constexpr int CHASE_MAX_SUBST = 4;  // max simultaneous substitutions
+        constexpr size_t CHASE_MAX_TRIALS = 2000;
+        std::vector<int> pos(n_nib);
+        for (uint32_t i = 0; i < n_nib; i++) pos[i] = (int)i;
+        std::sort(pos.begin(), pos.end(),
+                  [&](int a, int b) { return nib_margin[a] < nib_margin[b]; });
+        int k = std::min<int>(CHASE_K, (int)n_nib);
+
+        // Enumerate substitution patterns over the k candidates, cheapest first
+        struct Cand { double cost; uint32_t mask; };
+        std::vector<Cand> cands;
+        for (uint32_t mask = 1; mask < (1u << k); mask++) {
+            int nb = __builtin_popcount(mask);
+            if (nb > CHASE_MAX_SUBST) continue;
+            double cost = 0;
+            for (int b = 0; b < k; b++)
+                if (mask & (1u << b)) cost += nib_margin[pos[b]];
+            cands.push_back({cost, mask});
+        }
+        std::sort(cands.begin(), cands.end(),
+                  [](const Cand &a, const Cand &b) { return a.cost < b.cost; });
+        if (cands.size() > CHASE_MAX_TRIALS) cands.resize(CHASE_MAX_TRIALS);
+
+        std::vector<uint8_t> trial_nib(nibbles.begin(), nibbles.begin() + n_nib);
+        std::vector<uint8_t> trial_bytes(total_bytes);
+        for (const Cand &c : cands) {
+            for (int b = 0; b < k; b++)
+                if (c.mask & (1u << b)) trial_nib[pos[b]] = nib_alt[pos[b]];
+            nibbles_to_bytes(trial_nib.data(), trial_bytes.data(), total_bytes);
+            if (payload_crc_ok(trial_bytes.data())) {
+                bytes = trial_bytes;
+                return __builtin_popcount(c.mask);
+            }
+            // undo substitutions for the next pattern
+            for (int b = 0; b < k; b++)
+                if (c.mask & (1u << b)) trial_nib[pos[b]] = nibbles[pos[b]];
+        }
+        return 0;
+    }
+
+    // Re-derive one block's nibbles from stored magnitudes, optionally
+    // suppressing the dominant bin of some symbols (collision hypothesis:
+    // the top peak was the interferer, the runner-up peak is ours) and/or
+    // rotating the bin->symbol mapping (integer CFO mis-split hypothesis).
+    void redecode_block(const BlockRec &rec, uint32_t suppress_mask, int rot,
+                        std::vector<uint8_t> &out_nib, int companion = 0) const {
+        const uint16_t *map = m_ldro ? demap_hdr.data() : demap_pay.data();
+        std::array<std::array<double, MAX_SF>, 8> llrs{};
+        std::vector<float> mags;
+        for (int s = 0; s < rec.cw_len; s++) {
+            const float *m = rec.mags[s].data();
+            if (suppress_mask & (1u << s)) {
+                mags.assign(rec.mags[s].begin(), rec.mags[s].end());
+                uint32_t mx = (uint32_t)(std::max_element(mags.begin(), mags.end()) - mags.begin());
+                mags[mx] = 0;
+                m = mags.data();
+            }
+            for (uint32_t i = 0; i < cfg.sf; i++) {
+                float max_X1 = -1, max_X0 = -1;
+                for (uint32_t n = 0; n < N; n++) {
+                    float v = m[(n + rot + N) % N];
+                    // companion combining: add the energy of a same-data copy
+                    // at constant bin offset (simultaneous flood rebroadcast
+                    // from a second transmitter, or adjacent-bin smear for
+                    // companion=1), turning the collision into diversity
+                    if (companion) v += m[(n + rot + N + companion) % N];
+                    if (map[n] & (1u << i)) {
+                        if (v > max_X1) max_X1 = v;
+                    } else {
+                        if (v > max_X0) max_X0 = v;
+                    }
+                }
+                llrs[s][cfg.sf - 1 - i] = (double)max_X1 - (double)max_X0;
+            }
+        }
+        double deinter[MAX_SF][8];
+        for (int i = 0; i < rec.cw_len; i++)
+            for (int j = 0; j < rec.sf_app; j++)
+                deinter[mod(i - j - 1, rec.sf_app)][i] = llrs[i][cfg.sf - rec.sf_app + j];
+        out_nib.resize(rec.sf_app);
+        for (int i = 0; i < rec.sf_app; i++)
+            out_nib[i] = hamming_decode_soft(deinter[i], rec.cr_app);
+    }
+
+    // Rotation chase: hypothesize the integer/fractional CFO split was off by
+    // a whole bin (the frac estimator wraps at +/-0.5, and real dongles sit
+    // several bins off), which shifts EVERY payload symbol by a constant
+    // offset. The header still decodes because its reduced-rate demap (v/4)
+    // tolerates small shifts - so a valid header plus confidently-wrong
+    // payload is this failure's signature. Re-decode all blocks from stored
+    // magnitudes under a rotated bin mapping; only 4 CRC trials.
+    int rotation_chase(std::vector<uint8_t> &bytes, uint32_t total_bytes) {
+        const uint32_t n_nib = 2 * total_bytes;
+        if (block_recs.empty() || nibbles.size() < n_nib) return 0;
+        static const int SHIFTS[] = {1, -1, 2, -2};
+        std::vector<uint8_t> trial_nib(nibbles.begin(), nibbles.begin() + n_nib);
+        std::vector<uint8_t> trial_bytes(total_bytes), blk_nib;
+        for (int shift : SHIFTS) {
+            for (const BlockRec &rec : block_recs) {
+                if (rec.nib_start >= (int)n_nib) break;
+                redecode_block(rec, 0, shift, blk_nib);
+                for (int i = 0; i < rec.sf_app; i++) {
+                    int p = rec.nib_start + i;
+                    if (p >= 0 && p < (int)n_nib) trial_nib[p] = blk_nib[i];
+                }
+            }
+            nibbles_to_bytes(trial_nib.data(), trial_bytes.data(), total_bytes);
+            if (payload_crc_ok(trial_bytes.data())) {
+                bytes = trial_bytes;
+                return shift;
+            }
+        }
+        return 0;
+    }
+
+    // Estimate a persistent secondary-peak offset across the frame's payload
+    // symbols. Two simultaneous rebroadcasts of the same flood frame (common
+    // in MeshCore) appear as one signal plus a same-data copy at a constant
+    // bin offset (their CFO difference); this finds that offset. Returns 0 if
+    // no offset repeats often enough to be structural.
+    int estimate_companion_offset() const {
+        std::vector<int> hist(N, 0);
+        int nsym = 0;
+        for (const auto &rec : block_recs) {
+            for (int s = 0; s < rec.cw_len; s++, nsym++) {
+                const auto &m = rec.mags[s];
+                int b1 = (int)(std::max_element(m.begin(), m.end()) - m.begin());
+                float best2 = -1;
+                int b2 = -1;
+                for (int nn = 0; nn < (int)N; nn++) {
+                    int dd = std::abs(((nn - b1 + (int)N / 2) % (int)N + (int)N) % (int)N - (int)N / 2);
+                    if (dd <= 2) continue; // skip the main peak's own leakage
+                    if (m[nn] > best2) { best2 = m[nn]; b2 = nn; }
+                }
+                if (b2 >= 0 && best2 > 0.35f * m[b1])
+                    hist[((b2 - b1) % (int)N + (int)N) % (int)N]++;
+            }
+        }
+        int G = 0, cnt = 0;
+        for (int g = 3; g <= (int)N - 3; g++)
+            if (hist[g] > cnt) { cnt = hist[g]; G = g; }
+        int thresh = nsym / 5 > 4 ? nsym / 5 : 4;
+        return cnt >= thresh ? G : 0;
+    }
+
+    // Companion chase: re-decode with each bin's metric summed with its
+    // same-data copy. G learned from the frame (flood collision) with G=1
+    // (adjacent-bin smear) as fallback; each tried at shifts 0/-1/+1.
+    int companion_chase(std::vector<uint8_t> &bytes, uint32_t total_bytes) {
+        const uint32_t n_nib = 2 * total_bytes;
+        if (block_recs.empty() || nibbles.size() < n_nib) return 0;
+        int G_hist = estimate_companion_offset();
+        const int GS[2] = {G_hist, 1};
+        static const int SHIFTS[] = {0, -1, 1};
+        std::vector<uint8_t> trial_nib(nibbles.begin(), nibbles.begin() + n_nib);
+        std::vector<uint8_t> trial_bytes(total_bytes), blk_nib;
+        for (int G : GS) {
+            if (G == 0) continue;
+            for (int shift : SHIFTS) {
+                for (const BlockRec &rec : block_recs) {
+                    if (rec.nib_start >= (int)n_nib) break;
+                    redecode_block(rec, 0, shift, blk_nib, G);
+                    for (int i = 0; i < rec.sf_app; i++) {
+                        int p = rec.nib_start + i;
+                        if (p >= 0 && p < (int)n_nib) trial_nib[p] = blk_nib[i];
+                    }
+                }
+                nibbles_to_bytes(trial_nib.data(), trial_bytes.data(), total_bytes);
+                if (payload_crc_ok(trial_bytes.data())) {
+                    bytes = trial_bytes;
+                    return G;
+                }
+            }
+        }
+        return 0;
+    }
+
+    // Straddle chase: when sync locks between two time-offset copies of the
+    // same frame (simultaneous flood rebroadcasts ~ms apart), every payload
+    // window straddles two symbols nearly 50/50 - each window's runner-up
+    // peak is the NEXT symbol's main peak. A symbol's energy is then split
+    // between its own window and the previous one at the SAME bin, so
+    // re-deciding on the sum of adjacent windows' magnitudes reconstitutes
+    // full symbol energy while the straddle ghost keeps only a partial share.
+    // dir=+1 sums with the previous window, dir=-1 with the next.
+    int straddle_chase(std::vector<uint8_t> &bytes, uint32_t total_bytes) {
+        const uint32_t n_nib = 2 * total_bytes;
+        if (block_recs.empty() || nibbles.size() < n_nib) return 0;
+        // flat list of all stored payload symbols, in order
+        std::vector<const std::vector<float> *> sym;
+        for (const auto &rec : block_recs)
+            for (int s = 0; s < rec.cw_len; s++) sym.push_back(&rec.mags[s]);
+        std::vector<uint8_t> trial_nib(nibbles.begin(), nibbles.begin() + n_nib);
+        std::vector<uint8_t> trial_bytes(total_bytes), blk_nib;
+        for (int dir : {1, -1}) {
+            int base = 0;
+            for (const BlockRec &rec : block_recs) {
+                if (rec.nib_start >= (int)n_nib) break;
+                BlockRec comb;
+                comb.nib_start = rec.nib_start;
+                comb.cw_len = rec.cw_len;
+                comb.sf_app = rec.sf_app;
+                comb.cr_app = rec.cr_app;
+                comb.mags.resize(rec.cw_len);
+                for (int s = 0; s < rec.cw_len; s++) {
+                    int gi = base + s, oi = gi - dir;
+                    comb.mags[s] = rec.mags[s];
+                    if (oi >= 0 && oi < (int)sym.size())
+                        for (uint32_t n = 0; n < N; n++) comb.mags[s][n] += (*sym[oi])[n];
+                }
+                redecode_block(comb, 0, 0, blk_nib);
+                for (int i = 0; i < rec.sf_app; i++) {
+                    int p = rec.nib_start + i;
+                    if (p >= 0 && p < (int)n_nib) trial_nib[p] = blk_nib[i];
+                }
+                base += rec.cw_len;
+            }
+            nibbles_to_bytes(trial_nib.data(), trial_bytes.data(), total_bytes);
+            if (payload_crc_ok(trial_bytes.data())) {
+                bytes = trial_bytes;
+                return dir;
+            }
+        }
+        return 0;
+    }
+
+    // Symbol-level chase: hypothesize that the strongest FFT peak of a few
+    // weak symbols was a colliding transmission, take each one's runner-up
+    // peak instead, re-decode the affected block(s) and re-check the CRC.
+    // Tries single symbols first, then pairs of the weakest ones.
+    int symbol_chase(std::vector<uint8_t> &bytes, uint32_t total_bytes) {
+        const uint32_t n_nib = 2 * total_bytes;
+        if (block_recs.empty() || nibbles.size() < n_nib) return 0;
+
+        struct SymCand { float dominance; int blk, sym; };
+        std::vector<SymCand> sc;
+        for (int b = 0; b < (int)block_recs.size(); b++) {
+            const BlockRec &rec = block_recs[b];
+            if (rec.nib_start >= (int)n_nib) break; // padding blocks
+            for (int s = 0; s < rec.cw_len; s++) {
+                const auto &m = rec.mags[s];
+                float m1 = -1, m2 = -1;
+                for (float v : m) {
+                    if (v > m1) { m2 = m1; m1 = v; }
+                    else if (v > m2) m2 = v;
+                }
+                if (m1 <= 0) continue;
+                sc.push_back({m2 / m1, b, s});
+            }
+        }
+        // weakest decisions first (runner-up peak nearly as strong as winner)
+        std::sort(sc.begin(), sc.end(),
+                  [](const SymCand &a, const SymCand &b) { return a.dominance > b.dominance; });
+
+        constexpr int SC_SINGLES = 24, SC_PAIRS_OF = 12;
+        std::vector<uint8_t> trial_nib(nibbles.begin(), nibbles.begin() + n_nib);
+        std::vector<uint8_t> trial_bytes(total_bytes), blk_nib;
+
+        auto apply_block = [&](int b, uint32_t mask) {
+            const BlockRec &rec = block_recs[b];
+            redecode_block(rec, mask, 0, blk_nib);
+            for (int i = 0; i < rec.sf_app; i++) {
+                int p = rec.nib_start + i;
+                if (p >= 0 && p < (int)n_nib) trial_nib[p] = blk_nib[i];
+            }
+        };
+        auto restore_block = [&](int b) {
+            const BlockRec &rec = block_recs[b];
+            for (int i = 0; i < rec.sf_app; i++) {
+                int p = rec.nib_start + i;
+                if (p >= 0 && p < (int)n_nib) trial_nib[p] = nibbles[p];
+            }
+        };
+        auto crc_pass = [&]() {
+            nibbles_to_bytes(trial_nib.data(), trial_bytes.data(), total_bytes);
+            if (payload_crc_ok(trial_bytes.data())) { bytes = trial_bytes; return true; }
+            return false;
+        };
+
+        int n_single = std::min<int>(SC_SINGLES, (int)sc.size());
+        for (int i = 0; i < n_single; i++) {
+            apply_block(sc[i].blk, 1u << sc[i].sym);
+            if (crc_pass()) return 1;
+            restore_block(sc[i].blk);
+        }
+        int n_pair = std::min<int>(SC_PAIRS_OF, (int)sc.size());
+        for (int i = 0; i < n_pair; i++) {
+            for (int j = i + 1; j < n_pair; j++) {
+                if (sc[i].blk == sc[j].blk) {
+                    apply_block(sc[i].blk, (1u << sc[i].sym) | (1u << sc[j].sym));
+                } else {
+                    apply_block(sc[i].blk, 1u << sc[i].sym);
+                    apply_block(sc[j].blk, 1u << sc[j].sym);
+                }
+                if (crc_pass()) return 2;
+                restore_block(sc[i].blk);
+                restore_block(sc[j].blk);
+            }
+        }
+        return 0;
+    }
+
+    // Diagnostic (LORA_DEBUG_FAIL=1): per-symbol peak stats of a frame that
+    // failed CRC even after chase, to identify the corruption mechanism
+    // (fade = dominance collapse, timing slip = fractional offset drift).
+    void dump_failed_frame() const {
+        std::lock_guard<std::mutex> lk(g_print_mtx);
+        fprintf(stderr, "%s  [faildump] pay_len=%u snr=%.1f blocks=%zu companion_G=%d\n",
+                tag.c_str(), m_pay_len, current_snr, block_recs.size(),
+                estimate_companion_offset());
+        int sym_i = 0;
+        for (const auto &rec : block_recs) {
+            for (int s = 0; s < rec.cw_len; s++, sym_i++) {
+                std::vector<float> m = rec.mags[s];
+                uint32_t mx = (uint32_t)(std::max_element(m.begin(), m.end()) - m.begin());
+                float m1 = m[mx];
+                // top-3 peaks with +-2 exclusion zones, like the offline analysis
+                int b2 = -1, b3 = -1;
+                {
+                    std::vector<float> mm = m;
+                    for (int k = -2; k <= 2; k++) mm[(mx + N + k) % N] = 0;
+                    b2 = (int)(std::max_element(mm.begin(), mm.end()) - mm.begin());
+                    float a2 = mm[b2];
+                    for (int k = -2; k <= 2; k++) mm[(b2 + N + k) % N] = 0;
+                    b3 = (int)(std::max_element(mm.begin(), mm.end()) - mm.begin());
+                    fprintf(stderr, "%s  [faildump] sym=%3d bin=%3u dom=%.2f p2=%3d:%.2f p3=%3d:%.2f\n",
+                            tag.c_str(), sym_i, mx, a2 / m1, b2, a2 / m1, b3, mm[b3] / m1);
+                }
+            }
+        }
+    }
+
+    // Re-demodulate the whole frame (header included) from the retained ring
+    // samples with the symbol windows shifted by `delta` samples. Rescues
+    // frames where sync locked between two time-offset copies of the same
+    // flood frame: every window straddles two symbols, poisoning both the
+    // header (wrong pay_len that passes the 5-bit checksum by luck) and the
+    // payload. Re-parsing the header under the shifted timing recovers the
+    // TRUE frame parameters. Returns true and fills the outputs on CRC pass.
+    bool redecode_frame(long delta, std::vector<uint8_t> &out_payload, bool &out_has_crc) {
+        std::vector<cx> win(N);
+        std::vector<std::array<double, MAX_SF>> blk;
+        std::vector<uint8_t> nibs;
+        bool hdr = true, ldro = false, pcrc = cfg.has_crc;
+        int pcr = cfg.cr;
+        uint32_t plen = 0, total_syms = 8;
+        float scum = frame_sfo_cum0;
+        long start = (long)frame_start_abs + delta;
+        long sto_off = my_roundf(m_sto_frac * os);
+        for (uint32_t s = 0; s < total_syms && s < 4096; s++) {
+            for (uint32_t ii = 0; ii < N; ii++) {
+                long idx = start + os / 2 + (long)os * ii - sto_off;
+                if (!sample_at_abs(idx, win[ii])) return false;
+            }
+            blk.push_back(compute_LLRs_map(win.data(), hdr || ldro, (int)(delta / os)));
+            int block_size = 4 + (hdr ? 4 : pcr);
+            if ((int)blk.size() == block_size) {
+                int sf_app = (hdr || ldro) ? cfg.sf - 2 : cfg.sf;
+                int cw_len = block_size;
+                int cr_app = hdr ? 4 : pcr;
+                double deinter[MAX_SF][8];
+                for (int i = 0; i < cw_len; i++)
+                    for (int j = 0; j < sf_app; j++)
+                        deinter[mod(i - j - 1, sf_app)][i] = blk[i][cfg.sf - sf_app + j];
+                for (int i = 0; i < sf_app; i++)
+                    nibs.push_back(hamming_decode_soft(deinter[i], cr_app));
+                blk.clear();
+                if (hdr && nibs.size() >= 5) {
+                    if (!header_consistent(nibs.data())) return false;
+                    plen = (nibs[0] << 4) | nibs[1];
+                    pcrc = nibs[2] & 1;
+                    pcr = nibs[2] >> 1;
+                    if (pcr < 1) pcr = 1;
+                    if (pcr > 4) pcr = 4;
+                    if (plen == 0 || plen > 255) return false;
+                    // Without a payload CRC there is nothing to validate a
+                    // retimed hypothesis against - the 5-bit header checksum
+                    // alone would accept garbage. Only pursue CRC'd frames.
+                    if (!pcrc) return false;
+                    ldro = ((float)(1u << cfg.sf) * 1e3f / cfg.bw) > LDRO_MAX_DURATION_MS;
+                    int sf2 = cfg.sf - 2 * (ldro ? 1 : 0);
+                    total_syms = 8 + (int)ceil((double)(2 * plen - cfg.sf + 2 + 5 + (pcrc ? 4 : 0)) / sf2) * (4 + pcr);
+                    hdr = false;
+                    nibs.erase(nibs.begin(), nibs.begin() + 5);
+                }
+            }
+            long consume = sps;
+            if (fabsf(scum) > 1.0f / 2.0f / os) {
+                int sg = (scum >= 0) ? 1 : -1;
+                consume -= sg;
+                scum -= sg * 1.0f / os;
+            }
+            scum += sfo_hat;
+            start += consume;
+        }
+        if (hdr) return false;
+        uint32_t need = plen * 2 + (pcrc ? 4 : 0);
+        if (nibs.size() < need) return false;
+        uint32_t tb = plen + (pcrc ? 2 : 0);
+        std::vector<uint8_t> bytes(tb);
+        for (uint32_t i = 0; i < tb; i++) {
+            uint8_t lo = nibs[2 * i], hi = nibs[2 * i + 1];
+            if (i < plen) {
+                lo ^= whitening_seq[i] & 0x0F;
+                hi ^= (whitening_seq[i] >> 4) & 0x0F;
+            }
+            bytes[i] = (hi << 4) | lo;
+        }
+        if (pcrc) {
+            if (plen < 2) return false;
+            uint16_t calc = crc16(bytes.data(), plen - 2);
+            calc = calc ^ bytes[plen - 1] ^ ((uint16_t)bytes[plen - 2] << 8);
+            uint16_t rx = bytes[plen] | ((uint16_t)bytes[plen + 1] << 8);
+            if (calc != rx) return false;
+        }
+        out_payload.assign(bytes.begin(), bytes.begin() + plen);
+        out_has_crc = pcrc;
+        return true;
+    }
+
+    // Scan retimings, nearest first. Half-symbol reach in steps of N/16 chips.
+    long retime_chase(std::vector<uint8_t> &out_payload, bool &out_has_crc) {
+        for (uint32_t step = N / 16; step <= N / 2; step += N / 16) {
+            for (int sgn : {1, -1}) {
+                long delta = (long)sgn * (long)step * os;
+                if (redecode_frame(delta, out_payload, out_has_crc))
+                    return delta;
+            }
+        }
+        return 0;
+    }
+
+    void assemble_and_output() {
+        uint32_t total_bytes = m_pay_len + (m_pay_has_crc ? 2 : 0);
+        std::vector<uint8_t> bytes(total_bytes);
+        nibbles_to_bytes(nibbles.data(), bytes.data(), total_bytes);
 
         Packet pkt;
-        pkt.payload.assign(bytes.begin(), bytes.begin() + m_pay_len);
         pkt.has_crc = m_pay_has_crc;
         pkt.snr_est = current_snr;
         pkt.crc_valid = false;
+        int chase_n = 0;
 
         if (m_pay_has_crc && m_pay_len >= 2) {
-            uint16_t calc_crc = crc16(pkt.payload.data(), m_pay_len - 2);
-            calc_crc = calc_crc ^ pkt.payload[m_pay_len - 1] ^ ((uint16_t)pkt.payload[m_pay_len - 2] << 8);
-            uint16_t rx_crc = bytes[m_pay_len] | ((uint16_t)bytes[m_pay_len + 1] << 8);
-            pkt.crc_valid = (calc_crc == rx_crc);
+            pkt.crc_valid = payload_crc_ok(bytes.data());
+            if (!pkt.crc_valid && cfg.soft_decoding) {
+                // Recovery ladder, most-trustworthy hypothesis class first:
+                // rotation (4 trials) -> nibble chase (<=2000) -> symbol chase.
+                if (int rot = rotation_chase(bytes, total_bytes)) {
+                    pkt.crc_valid = true;
+                    std::lock_guard<std::mutex> lk(g_print_mtx);
+                    fprintf(stderr, "%s  Rotation chase: CRC ok with %+d bin shift\n",
+                            tag.c_str(), rot);
+                } else if ((chase_n = chase_recover(bytes, total_bytes)) > 0) {
+                    pkt.crc_valid = true;
+                    std::lock_guard<std::mutex> lk(g_print_mtx);
+                    fprintf(stderr, "%s  Chase recovery: CRC ok after %d nibble substitution(s)\n",
+                            tag.c_str(), chase_n);
+                } else if (int sym_n = symbol_chase(bytes, total_bytes)) {
+                    pkt.crc_valid = true;
+                    std::lock_guard<std::mutex> lk(g_print_mtx);
+                    fprintf(stderr, "%s  Symbol chase: CRC ok after %d symbol substitution(s)\n",
+                            tag.c_str(), sym_n);
+                } else if (int G = companion_chase(bytes, total_bytes)) {
+                    pkt.crc_valid = true;
+                    std::lock_guard<std::mutex> lk(g_print_mtx);
+                    fprintf(stderr, "%s  Companion chase: CRC ok combining bins %+d apart\n",
+                            tag.c_str(), G);
+                } else if (int sd = straddle_chase(bytes, total_bytes)) {
+                    pkt.crc_valid = true;
+                    std::lock_guard<std::mutex> lk(g_print_mtx);
+                    fprintf(stderr, "%s  Straddle chase: CRC ok summing adjacent windows (dir %+d)\n",
+                            tag.c_str(), sd);
+                } else {
+                    std::vector<uint8_t> rt_payload;
+                    bool rt_crc = true;
+                    if (long delta = retime_chase(rt_payload, rt_crc)) {
+                        // re-demod may have recovered a DIFFERENT (true)
+                        // header, so adopt its length/CRC flag wholesale
+                        m_pay_len = (uint32_t)rt_payload.size();
+                        m_pay_has_crc = rt_crc;
+                        bytes = rt_payload;
+                        pkt.has_crc = rt_crc;
+                        pkt.crc_valid = true;
+                        std::lock_guard<std::mutex> lk(g_print_mtx);
+                        fprintf(stderr, "%s  Retime chase: CRC ok at %+ld sample shift (pay_len=%u)\n",
+                                tag.c_str(), delta, m_pay_len);
+                    } else if (getenv("LORA_DEBUG_FAIL")) {
+                        dump_failed_frame();
+                    }
+                }
+            }
         } else if (!m_pay_has_crc) {
             pkt.crc_valid = true; // no CRC to check
         }
+        pkt.payload.assign(bytes.begin(), bytes.begin() + m_pay_len);
 
         {
             std::lock_guard<std::mutex> lk(g_print_mtx);
@@ -905,6 +1521,10 @@ private:
 
         last_packets.push_back(pkt);
         nibbles.clear();
+        nib_alt.clear();
+        nib_margin.clear();
+        block_recs.clear();
+        pending_mags.clear();
     }
 
     // Called when frame ends to flush any partial data
