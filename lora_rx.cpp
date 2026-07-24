@@ -974,16 +974,22 @@ private:
     // CRC-guided chase recovery: retry the CRC with the runner-up Hamming
     // codeword substituted at the least-confident nibble positions, testing
     // candidate error patterns in order of increasing implausibility (sum of
-    // decision margins). Returns the number of substituted nibbles, 0 if no
-    // pattern passed.
-    int chase_recover(std::vector<uint8_t> &bytes, uint32_t total_bytes) {
+    // decision margins). The FULL <=4-substitution space over the 16 weakest
+    // positions (2516 patterns) is always scanned: a trial cap would truncate
+    // a cost-sorted list whose tail order rides on noise-level margin
+    // differences, making recovery depend on input quantization. All passing
+    // patterns are counted and the most plausible one is adopted; n_passed
+    // reports the ambiguity (a unique passer is far more trustworthy than
+    // one of several - each extra passer is a CRC coincidence candidate).
+    // Returns the number of substituted nibbles, 0 if no pattern passed.
+    int chase_recover(std::vector<uint8_t> &bytes, uint32_t total_bytes, int &n_passed) {
         const uint32_t n_nib = 2 * total_bytes;
+        n_passed = 0;
         if (nib_margin.size() < n_nib || nib_alt.size() < n_nib) return 0;
 
         // k least-confident positions
         constexpr int CHASE_K = 16;         // positions considered
         constexpr int CHASE_MAX_SUBST = 4;  // max simultaneous substitutions
-        constexpr size_t CHASE_MAX_TRIALS = 2000;
         std::vector<int> pos(n_nib);
         for (uint32_t i = 0; i < n_nib; i++) pos[i] = (int)i;
         std::sort(pos.begin(), pos.end(),
@@ -1003,23 +1009,26 @@ private:
         }
         std::sort(cands.begin(), cands.end(),
                   [](const Cand &a, const Cand &b) { return a.cost < b.cost; });
-        if (cands.size() > CHASE_MAX_TRIALS) cands.resize(CHASE_MAX_TRIALS);
 
         std::vector<uint8_t> trial_nib(nibbles.begin(), nibbles.begin() + n_nib);
         std::vector<uint8_t> trial_bytes(total_bytes);
+        uint32_t best_mask = 0;
         for (const Cand &c : cands) {
             for (int b = 0; b < k; b++)
                 if (c.mask & (1u << b)) trial_nib[pos[b]] = nib_alt[pos[b]];
             nibbles_to_bytes(trial_nib.data(), trial_bytes.data(), total_bytes);
             if (payload_crc_ok(trial_bytes.data())) {
-                bytes = trial_bytes;
-                return __builtin_popcount(c.mask);
+                if (n_passed == 0) {  // cheapest passer = most plausible
+                    bytes = trial_bytes;
+                    best_mask = c.mask;
+                }
+                n_passed++;
             }
             // undo substitutions for the next pattern
             for (int b = 0; b < k; b++)
                 if (c.mask & (1u << b)) trial_nib[pos[b]] = nibbles[pos[b]];
         }
-        return 0;
+        return n_passed ? __builtin_popcount(best_mask) : 0;
     }
 
     // Re-derive one block's nibbles from stored magnitudes, optionally
@@ -1435,11 +1444,12 @@ private:
                     std::lock_guard<std::mutex> lk(g_print_mtx);
                     fprintf(stderr, "%s  Rotation chase: CRC ok with %+d bin shift\n",
                             tag.c_str(), rot);
-                } else if ((chase_n = chase_recover(bytes, total_bytes)) > 0) {
+                } else if (int n_passed = 0; (chase_n = chase_recover(bytes, total_bytes, n_passed)) > 0) {
                     pkt.crc_valid = true;
                     std::lock_guard<std::mutex> lk(g_print_mtx);
-                    fprintf(stderr, "%s  Chase recovery: CRC ok after %d nibble substitution(s)\n",
-                            tag.c_str(), chase_n);
+                    fprintf(stderr, "%s  Chase recovery: CRC ok after %d nibble substitution(s)%s\n",
+                            tag.c_str(), chase_n,
+                            n_passed > 1 ? " (AMBIGUOUS: multiple CRC-passing patterns)" : "");
                 } else if (int sym_n = symbol_chase(bytes, total_bytes)) {
                     pkt.crc_valid = true;
                     std::lock_guard<std::mutex> lk(g_print_mtx);
