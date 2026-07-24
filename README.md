@@ -64,7 +64,7 @@ make check      # builds the offline frame generator and runs end-to-end tests (
 | `-I` | Implicit header mode | off |
 | `-L <bytes>` | Payload length (implicit mode) | 11 |
 | `-A` | Auto-scan: run all SF (7-12) x BW decoders in parallel | off |
-| `-r <file>` | Replay IQ from file (rtl_sdr u8 format, `-` = stdin) instead of SDR | — |
+| `-r <file>` | Replay IQ from file (rtl_sdr u8 format, `-` = stdin) instead of SDR; a `.C16` file is read as PortaPack/Mayhem int16 IQ, with tuner freq and sample rate defaulted from its `.TXT` sidecar | — |
 | `-D <file>` | Dump raw IQ to file while receiving (replay later with `-r`) | — |
 
 ### Examples
