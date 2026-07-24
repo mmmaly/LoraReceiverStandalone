@@ -174,7 +174,6 @@ private:
     Cx in_down_[MAX_N], symb_[MAX_N], cfo_corr_[MAX_N];
     Cx pre_raw_[PRE_SYMS * MAX_N];
     Cx pre_up_[CFO_SYMS * MAX_N];
-    Cx cfo_fft_[CFO_SYMS * MAX_N];
     Fft fft_;
 
     // ---- frame-sync state (same fields as lora_rx) ----
@@ -359,20 +358,30 @@ private:
     uint8_t det_sync_ = 0;
 
     void estimate_cfo_frac(const Cx* s) {
+        // Pass 1: find each preamble symbol's peak bin (FFT into scratch).
         int k0v[UP_USE]; float k0m[UP_USE];
         for (int i = 0; i < UP_USE; i++) {
             for (int j = 0; j < N_; j++) dech_[j] = cxmul(s[N_ * i + j], downchirp_[j]);
-            fftN(dech_, &cfo_fft_[i * N_], N_);
+            fftN(dech_, fout_, N_);
             float mx = -1; int mi = 0;
-            for (int j = 0; j < N_; j++) { float m = cxnorm(cfo_fft_[i * N_ + j]); if (m > mx) { mx = m; mi = j; } }
+            for (int j = 0; j < N_; j++) { float m = cxnorm(fout_[j]); if (m > mx) { mx = m; mi = j; } }
             k0v[i] = mi; k0m[i] = mx;
         }
         int best = 0; for (int i = 1; i < UP_USE; i++) if (k0m[i] > k0m[best]) best = i;
         int im = k0v[best];
+        // Pass 2: recompute the FFTs and keep only the value at bin `im`.
+        // (Recomputing is cheaper in RAM than storing every symbol's FFT, and
+        //  only runs once per frame at sync.)
+        Cx binval[UP_USE];
+        for (int i = 0; i < UP_USE; i++) {
+            for (int j = 0; j < N_; j++) dech_[j] = cxmul(s[N_ * i + j], downchirp_[j]);
+            fftN(dech_, fout_, N_);
+            binval[i] = fout_[im];
+        }
         Cx acc = {0, 0};
         for (int i = 0; i < UP_USE - 1; i++)
-            acc = (Cx){acc.r + (cfo_fft_[im + N_ * i].r * cfo_fft_[im + N_ * (i + 1)].r + cfo_fft_[im + N_ * i].i * cfo_fft_[im + N_ * (i + 1)].i),
-                       acc.i + (cfo_fft_[im + N_ * i].i * cfo_fft_[im + N_ * (i + 1)].r - cfo_fft_[im + N_ * i].r * cfo_fft_[im + N_ * (i + 1)].i)};
+            acc = (Cx){acc.r + (binval[i].r * binval[i + 1].r + binval[i].i * binval[i + 1].i),
+                       acc.i + (binval[i].i * binval[i + 1].r - binval[i].r * binval[i + 1].i)};
         m_cfo_frac_ = -atan2f(acc.i, acc.r) / (2.0f * PI_F);
         for (int n = 0; n < UP_USE * N_; n++) {
             float a = -2.0f * PI_F * m_cfo_frac_ / N_ * n;
