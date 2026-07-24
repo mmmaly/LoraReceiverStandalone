@@ -1,0 +1,1273 @@
+From 68f65f0f6b8705df7d6b343a3625af74ebdd88b3 Mon Sep 17 00:00:00 2001
+From: Michal Maly <maly@brightpick.ai>
+Date: Fri, 24 Jul 2026 01:25:47 +0200
+Subject: [PATCH] Add LoRa RX app (lora_lite demodulator on M4 baseband +
+ external UI app)
+
+---
+ firmware/application/baseband_api.cpp         |   5 +
+ firmware/application/baseband_api.hpp         |   1 +
+ firmware/application/external/external.cmake  |   5 +
+ firmware/application/external/external.ld     |   7 +
+ firmware/application/external/lorarx/main.cpp |  78 +++
+ .../application/external/lorarx/ui_lorarx.cpp |  96 +++
+ .../application/external/lorarx/ui_lorarx.hpp |  88 +++
+ firmware/baseband/CMakeLists.txt              |   7 +
+ firmware/baseband/lora_kiss.h                 |  75 +++
+ firmware/baseband/lora_lite.h                 | 559 ++++++++++++++++++
+ firmware/baseband/proc_lorarx.cpp             |  82 +++
+ firmware/baseband/proc_lorarx.hpp             |  61 ++
+ firmware/common/message.hpp                   |  37 ++
+ firmware/common/spi_image.hpp                 |   1 +
+ 14 files changed, 1102 insertions(+)
+ create mode 100644 firmware/application/external/lorarx/main.cpp
+ create mode 100644 firmware/application/external/lorarx/ui_lorarx.cpp
+ create mode 100644 firmware/application/external/lorarx/ui_lorarx.hpp
+ create mode 100644 firmware/baseband/lora_kiss.h
+ create mode 100644 firmware/baseband/lora_lite.h
+ create mode 100644 firmware/baseband/proc_lorarx.cpp
+ create mode 100644 firmware/baseband/proc_lorarx.hpp
+
+diff --git a/firmware/application/baseband_api.cpp b/firmware/application/baseband_api.cpp
+index cea9a51..9168a1c 100644
+--- a/firmware/application/baseband_api.cpp
++++ b/firmware/application/baseband_api.cpp
+@@ -398,6 +398,11 @@ void set_subghzd_config(uint8_t modulation = 0, uint32_t sampling_rate = 0) {
+     send_message(&message);
+ }
+ 
++void set_lorarx(uint8_t sf, uint8_t cr, bool has_crc, uint16_t sync_word, uint32_t bandwidth) {
++    const LoRaRxConfigureMessage message{sf, cr, (uint8_t)(has_crc ? 1 : 0), sync_word, bandwidth};
++    send_message(&message);
++}
++
+ void set_moreserx_config(uint8_t mode) {
+     const MorseRXConfigureMessage message{mode};
+     send_message(&message);
+diff --git a/firmware/application/baseband_api.hpp b/firmware/application/baseband_api.hpp
+index 10eee20..131deeb 100644
+--- a/firmware/application/baseband_api.hpp
++++ b/firmware/application/baseband_api.hpp
+@@ -107,6 +107,7 @@ void set_siggen_tone(const uint32_t tone);
+ void set_siggen_config(const uint32_t bw, const uint32_t shape, const uint32_t duration);
+ void set_spectrum_painter_config(const uint16_t width, const uint16_t height, bool update, int32_t bw);
+ void set_subghzd_config(uint8_t modulation, uint32_t sampling_rate);
++void set_lorarx(uint8_t sf, uint8_t cr, bool has_crc, uint16_t sync_word, uint32_t bandwidth);
+ void set_moreserx_config(uint8_t mode);
+ void set_tonedetect_config(uint8_t squelch, uint32_t ctcss_freq_x10 = 0);
+ void set_morsetx_config(uint8_t mode, uint32_t tone, float fm_delta);
+diff --git a/firmware/application/external/external.cmake b/firmware/application/external/external.cmake
+index f1c85ec..39b4448 100644
+--- a/firmware/application/external/external.cmake
++++ b/firmware/application/external/external.cmake
+@@ -1,4 +1,8 @@
+ set(EXTCPPSRC
++	#lorarx
++	external/lorarx/main.cpp
++	external/lorarx/ui_lorarx.cpp
++
+ 	#afsk_rx   16 byte
+ 	external/afsk_rx/main.cpp
+ 	external/afsk_rx/ui_afsk_rx.cpp
+@@ -394,6 +398,7 @@ set(EXTCPPSRC
+ )
+ 
+ set(EXTAPPLIST
++	lorarx
+ 	afsk_rx
+ 	calculator
+ 	font_viewer
+diff --git a/firmware/application/external/external.ld b/firmware/application/external/external.ld
+index 6fc27a3..36c2a8a 100644
+--- a/firmware/application/external/external.ld
++++ b/firmware/application/external/external.ld
+@@ -115,6 +115,7 @@ MEMORY
+     ram_external_app_vor_tx                (rwx) : org = 0xAE0A0000, len = 32k
+     ram_external_app_signal_hunter         (rwx) : org = 0xAE0B0000, len = 32k
+     ram_external_app_tetra_rx              (rwx) : org = 0xAE0C0000, len = 32k
++    ram_external_app_lorarx                (rwx) : org = 0xAE0D0000, len = 32k
+ }
+ 
+ SECTIONS
+@@ -671,6 +672,12 @@ SECTIONS
+         *(*ui*external_app*tetra_rx*);
+     } > ram_external_app_tetra_rx
+ 
++    .external_app_lorarx : ALIGN(4) SUBALIGN(4)
++    {
++        KEEP(*(.external_app.app_lorarx.application_information));
++        *(*ui*external_app*lorarx*);
++    } > ram_external_app_lorarx
++
+ 
+ 
+ }
+diff --git a/firmware/application/external/lorarx/main.cpp b/firmware/application/external/lorarx/main.cpp
+new file mode 100644
+index 0000000..21a993e
+--- /dev/null
++++ b/firmware/application/external/lorarx/main.cpp
+@@ -0,0 +1,78 @@
++/*
++ * Copyright (C) 2026 (LoRa RX app)
++ *
++ * This file is part of PortaPack.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include "ui.hpp"
++#include "ui_lorarx.hpp"
++#include "ui_navigation.hpp"
++#include "external_app.hpp"
++
++namespace ui::external_app::lorarx {
++void initialize_app(ui::NavigationView& nav) {
++    nav.push<LoRaRxView>();
++}
++}  // namespace ui::external_app::lorarx
++
++extern "C" {
++
++__attribute__((section(".external_app.app_lorarx.application_information"), used)) application_information_t _application_information_lorarx = {
++    /*.memory_location = */ (uint8_t*)0x00000000,
++    /*.externalAppEntry = */ ui::external_app::lorarx::initialize_app,
++    /*.header_version = */ CURRENT_HEADER_VERSION,
++    /*.app_version = */ VERSION_MD5,
++
++    /*.app_name = */ "LoRa RX",
++    /*.bitmap_data = */ {
++        0x00,
++        0x00,
++        0x7C,
++        0x3E,
++        0x44,
++        0x22,
++        0x44,
++        0x22,
++        0x44,
++        0x22,
++        0x7C,
++        0x3E,
++        0x10,
++        0x08,
++        0x10,
++        0x08,
++        0x10,
++        0x08,
++        0xFE,
++        0x7F,
++        0x82,
++        0x41,
++        0xBA,
++        0x5D,
++        0xAA,
++        0x55,
++        0xBA,
++        0x5D,
++        0x82,
++        0x41,
++        0xFE,
++        0x7F,
++    },
++    /*.icon_color = */ ui::Color::green().v,
++    /*.menu_location = */ app_location_t::RX,
++    /*.desired_menu_position = */ -1,
++
++    /*.m4_app_tag = portapack::spi_flash::image_tag_lorarx */ {'P', 'L', 'O', 'R'},
++    /*.m4_app_offset = */ 0x00000000,  // will be filled at compile time
++};
++}
+diff --git a/firmware/application/external/lorarx/ui_lorarx.cpp b/firmware/application/external/lorarx/ui_lorarx.cpp
+new file mode 100644
+index 0000000..7b1bc2d
+--- /dev/null
++++ b/firmware/application/external/lorarx/ui_lorarx.cpp
+@@ -0,0 +1,96 @@
++/*
++ * Copyright (C) 2026 (LoRa RX app)
++ *
++ * This file is part of PortaPack.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include "ui_lorarx.hpp"
++#include "baseband_api.hpp"
++#include "string_format.hpp"
++#include "portapack.hpp"
++
++using namespace portapack;
++
++namespace ui::external_app::lorarx {
++
++LoRaRxView::LoRaRxView(NavigationView& nav)
++    : nav_{nav} {
++    baseband::run_prepared_image(portapack::memory::map::m4_code.base());
++
++    add_children({&field_rf_amp,
++                  &field_lna,
++                  &field_vga,
++                  &rssi,
++                  &channel,
++                  &field_frequency,
++                  &options_sf,
++                  &options_bw,
++                  &options_sync,
++                  &console});
++
++    field_frequency.set_value(869618000);  // Slovak MeshCore SF8 channel
++    options_sf.set_selected_index(1);      // SF8
++    options_bw.set_selected_index(0);      // 62.5 kHz
++    options_sync.set_selected_index(0);    // 0x12
++
++    options_sf.on_change = [this](size_t, auto) { configure_baseband(); };
++    options_bw.on_change = [this](size_t, auto) { configure_baseband(); };
++    options_sync.on_change = [this](size_t, auto) { configure_baseband(); };
++
++    receiver_model.enable();
++    configure_baseband();
++    console.writeln("LoRa RX ready. Waiting for packets...");
++}
++
++void LoRaRxView::configure_baseband() {
++    const uint8_t sf = (uint8_t)options_sf.selected_index_value();
++    const uint32_t bw = (uint32_t)options_bw.selected_index_value();
++    const uint16_t sync = (uint16_t)options_sync.selected_index_value();
++
++    // Baseband sample rate = bw * os(4) * decim(8). Keep the radio in step.
++    const uint32_t fs = bw * 4 * 8;
++    receiver_model.set_sampling_rate(fs);
++    receiver_model.set_baseband_bandwidth(fs / 2);
++
++    // cr is taken from the explicit header; pass 1 as a default, CRC on.
++    baseband::set_lorarx(sf, 1, true, sync, bw);
++}
++
++void LoRaRxView::on_packet(const LoRaPacketData& pkt) {
++    packet_count++;
++
++    // Console colour: ESC followed by a palette index (see afsk_rx). 11=green,
++    // 9=red for CRC ok / bad.
++    std::string line = "\x1B";
++    line += (char)(pkt.crc_ok ? 11 : 9);
++    line += to_string_dec_uint(packet_count) + ": ";
++    for (uint8_t i = 0; i < pkt.len; i++)
++        line += to_string_hex(pkt.data[i], 2);
++    console.writeln(line);
++
++    std::string info = "  SNR " + to_string_dec_int((int)pkt.snr) +
++                       " sync " + to_string_hex(pkt.sync, 2) +
++                       (pkt.crc_ok ? " CRC ok" : " CRC BAD");
++    console.writeln(info);
++}
++
++void LoRaRxView::focus() {
++    field_frequency.focus();
++}
++
++LoRaRxView::~LoRaRxView() {
++    receiver_model.disable();
++    baseband::shutdown();
++}
++
++}  // namespace ui::external_app::lorarx
+diff --git a/firmware/application/external/lorarx/ui_lorarx.hpp b/firmware/application/external/lorarx/ui_lorarx.hpp
+new file mode 100644
+index 0000000..ae493b4
+--- /dev/null
++++ b/firmware/application/external/lorarx/ui_lorarx.hpp
+@@ -0,0 +1,88 @@
++/*
++ * Copyright (C) 2026 (LoRa RX app)
++ *
++ * This file is part of PortaPack.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef __UI_LORARX_H__
++#define __UI_LORARX_H__
++
++#include "ui.hpp"
++#include "ui_navigation.hpp"
++#include "ui_receiver.hpp"
++#include "ui_freq_field.hpp"
++#include "app_settings.hpp"
++#include "radio_state.hpp"
++#include "log_file.hpp"
++
++using namespace ui;
++
++namespace ui::external_app::lorarx {
++
++class LoRaRxView : public View {
++   public:
++    LoRaRxView(NavigationView& nav);
++    ~LoRaRxView();
++
++    void focus() override;
++    std::string title() const override { return "LoRa RX"; };
++
++   private:
++    void configure_baseband();
++    void on_packet(const LoRaPacketData& pkt);
++
++    NavigationView& nav_;
++    RxRadioState radio_state_{};
++    app_settings::SettingsManager settings_{"rx_lora", app_settings::Mode::RX};
++
++    uint32_t packet_count{0};
++
++    RFAmpField field_rf_amp{{13 * 8, 0 * 16}};
++    LNAGainField field_lna{{15 * 8, 0 * 16}};
++    VGAGainField field_vga{{18 * 8, 0 * 16}};
++    RSSI rssi{{21 * 8, 0, 6 * 8, 4}};
++    Channel channel{{21 * 8, 5, 6 * 8, 4}};
++
++    RxFrequencyField field_frequency{{0 * 8, 0 * 16}, nav_};
++
++    // SF 7..12
++    OptionsField options_sf{
++        {0 * 8, 1 * 16 + 8},
++        6,
++        {{"SF7", 7}, {"SF8", 8}}};
++
++    // Bandwidth (kHz) — decimation supports 62.5k and 125k
++    OptionsField options_bw{
++        {7 * 8, 1 * 16 + 8},
++        8,
++        {{"BW62.5k", 62500}, {"BW125k", 125000}}};
++
++    // Sync word (0x12 public, 0x34 private, 0 = any)
++    OptionsField options_sync{
++        {17 * 8, 1 * 16 + 8},
++        9,
++        {{"sync 12", 0x12}, {"sync 34", 0x34}, {"sync any", 0x00}}};
++
++    Console console{{0, 3 * 16, screen_width, screen_height - 3 * 16}};
++
++    MessageHandlerRegistration message_handler_packet{
++        Message::ID::LoRaRxPacket,
++        [this](Message* const p) {
++            const auto message = static_cast<const LoRaRxPacketMessage*>(p);
++            this->on_packet(*message->packet);
++        }};
++};
++
++}  // namespace ui::external_app::lorarx
++
++#endif /*__UI_LORARX_H__*/
+diff --git a/firmware/baseband/CMakeLists.txt b/firmware/baseband/CMakeLists.txt
+index 6ea2595..9b4f7fc 100644
+--- a/firmware/baseband/CMakeLists.txt
++++ b/firmware/baseband/CMakeLists.txt
+@@ -552,6 +552,13 @@ set(MODE_CPPSRC
+ )
+ DeclareTargets(PAFR afskrx)
+ 
++### LoRa RX
++
++set(MODE_CPPSRC
++	proc_lorarx.cpp
++)
++DeclareTargets(PLOR lorarx)
++
+ ### EPIRB
+ 
+ set(MODE_CPPSRC
+diff --git a/firmware/baseband/lora_kiss.h b/firmware/baseband/lora_kiss.h
+new file mode 100644
+index 0000000..bbc8b8e
+--- /dev/null
++++ b/firmware/baseband/lora_kiss.h
+@@ -0,0 +1,75 @@
++// Tiny self-contained radix-2 iterative FFT for lora_lite.
++// No malloc, no recursion; twiddles precomputed once into a static table sized
++// for the largest transform (2*MAX_N). Forward transform only, matching the
++// sign convention of kiss_fft (which lora_rx used), so host and target agree.
++#pragma once
++#include <cstdint>
++#include <cmath>
++
++namespace lora_lite {
++struct Cx;  // fwd (defined in lora_lite.h)
++
++// LORA_PI is not guaranteed under strict ISO C++ (e.g. newlib on the M4 target).
++static constexpr double LORA_PI = 3.14159265358979323846;
++
++class Fft {
++public:
++    // max_log2 = log2 of the largest transform size that will be requested.
++    void init(int max_log2) {
++        maxlog_ = max_log2;
++        int maxN = 1 << max_log2;
++        for (int i = 0; i < maxN; i++) {
++            double a = -2.0 * LORA_PI * i / maxN;   // full-size twiddles; subsampled per stage
++            tw_[i][0] = (float)cos(a);
++            tw_[i][1] = (float)sin(a);
++        }
++        maxN_ = maxN;
++    }
++
++    // out[k] = sum_n in[n] exp(-j 2pi n k / n)   (kiss_fft forward convention)
++    void run(const Cx* in, Cx* out, int n) {
++        const float* pin = reinterpret_cast<const float*>(in);
++        float* pout = reinterpret_cast<float*>(out);
++        int log2n = 0; while ((1 << log2n) < n) log2n++;
++
++        // bit-reversal copy
++        for (int i = 0; i < n; i++) {
++            int j = bitrev(i, log2n);
++            pout[2 * j]     = pin[2 * i];
++            pout[2 * j + 1] = pin[2 * i + 1];
++        }
++        // Danielson-Lanczos stages
++        for (int s = 1; s <= log2n; s++) {
++            int m = 1 << s;          // butterfly span
++            int half = m >> 1;
++            int twstep = maxN_ / m;  // subsample the full twiddle table
++            for (int k = 0; k < n; k += m) {
++                for (int j = 0; j < half; j++) {
++                    float wr = tw_[j * twstep][0];
++                    float wi = tw_[j * twstep][1];
++                    float* a = &pout[2 * (k + j)];
++                    float* b = &pout[2 * (k + j + half)];
++                    float tr = wr * b[0] - wi * b[1];
++                    float ti = wr * b[1] + wi * b[0];
++                    b[0] = a[0] - tr; b[1] = a[1] - ti;
++                    a[0] = a[0] + tr; a[1] = a[1] + ti;
++                }
++            }
++        }
++    }
++
++private:
++    static int bitrev(int x, int bits) {
++        int r = 0;
++        for (int i = 0; i < bits; i++) { r = (r << 1) | (x & 1); x >>= 1; }
++        return r;
++    }
++#ifndef LORA_LITE_MAX_SF
++#define LORA_LITE_MAX_SF 10
++#endif
++    static constexpr int TWMAX = 1 << (LORA_LITE_MAX_SF + 1);
++    float tw_[TWMAX][2];
++    int maxlog_ = 0, maxN_ = 0;
++};
++
++} // namespace lora_lite
+diff --git a/firmware/baseband/lora_lite.h b/firmware/baseband/lora_lite.h
+new file mode 100644
+index 0000000..5e1cdab
+--- /dev/null
++++ b/firmware/baseband/lora_lite.h
+@@ -0,0 +1,559 @@
++// lora_lite - embedded-friendly LoRa demodulator core.
++//
++// A no-malloc, no-thread, single-SF/BW reduction of the lora_rx demodulation
++// chain, sized entirely with compile-time static buffers so it can run inside
++// a Cortex-M4 baseband image (PortaPack/Mayhem) as well as on a host.
++//
++// It expects IQ already decimated to os = LORA_LITE_OS samples per chip
++// (i.e. sample_rate = os * bandwidth), fed as interleaved complex floats.
++// Call feed() with each block of samples; decoded packets are delivered via a
++// callback. Nothing here allocates or blocks.
++//
++// Derived from lora_rx.cpp (which is in turn based on gr-lora_sdr). The DSP is
++// bit-for-bit the same; only the memory model differs.
++#pragma once
++#include <cstdint>
++#include <cstring>
++#include <cstdlib>
++#include <cmath>
++
++// Defaults chosen to fit the PortaPack M4 baseband SRAM budget (96 KiB data,
++// shared with the RTOS). SF up to 8 (N=256) covers MeshCore SF7/SF8; a host
++// build can raise LORA_LITE_MAX_SF for wider coverage.
++// NOTE: these must be defined before including lora_kiss.h, which sizes its
++// twiddle table from LORA_LITE_MAX_SF.
++#ifndef LORA_LITE_MAX_SF
++#define LORA_LITE_MAX_SF 8
++#endif
++#ifndef LORA_LITE_OS
++#define LORA_LITE_OS 2               // samples per chip after decimation
++#endif
++#ifndef LORA_LITE_MAX_PAYLOAD
++#define LORA_LITE_MAX_PAYLOAD 64     // bytes; MeshCore frames fit easily
++#endif
++
++#include "lora_kiss.h"   // tiny self-contained radix-2 FFT
++
++namespace lora_lite {
++
++static constexpr int   MAX_N   = 1 << LORA_LITE_MAX_SF;
++static constexpr int   OS      = LORA_LITE_OS;
++static constexpr int   MAX_SPS = MAX_N * OS;
++static constexpr float PI_F    = 3.14159265358979323846f;
++// Preamble capture depth: N_UP_REQ symbols raw, UP_USE for CFO/STO estimation.
++static constexpr int   PRE_SYMS = 5;   // == N_UP_REQ
++static constexpr int   CFO_SYMS = 4;   // == UP_USE
++
++struct Cx { float r, i; };
++static inline Cx cxmul(Cx a, Cx b) { return {a.r * b.r - a.i * b.i, a.r * b.i + a.i * b.r}; }
++static inline Cx cxconj(Cx a) { return {a.r, -a.i}; }
++static inline float cxnorm(Cx a) { return a.r * a.r + a.i * a.i; }
++static inline long lmod(long a, long b) { return ((a % b) + b) % b; }
++
++// Decoded packet handed to the caller.
++struct Packet {
++    uint8_t  data[LORA_LITE_MAX_PAYLOAD];
++    uint8_t  len;
++    bool     crc_ok;
++    bool     has_crc;
++    float    snr;
++    float    cfo;      // in bins
++    uint8_t  sync;     // detected sync word
++};
++
++// ---- Hamming / whitening / CRC tables (shared with lora_rx) ----
++static const uint8_t WHITEN[255] = {
++    0xFF,0xFE,0xFC,0xF8,0xF0,0xE1,0xC2,0x85,0x0B,0x17,0x2F,0x5E,0xBC,0x78,0xF1,0xE3,
++    0xC6,0x8D,0x1A,0x34,0x68,0xD0,0xA0,0x40,0x80,0x01,0x02,0x04,0x08,0x11,0x23,0x47,
++    0x8E,0x1C,0x38,0x71,0xE2,0xC4,0x89,0x12,0x25,0x4B,0x97,0x2E,0x5C,0xB8,0x70,0xE0,
++    0xC0,0x81,0x03,0x06,0x0C,0x19,0x32,0x64,0xC9,0x92,0x24,0x49,0x93,0x26,0x4D,0x9B,
++    0x37,0x6E,0xDC,0xB9,0x72,0xE4,0xC8,0x90,0x20,0x41,0x82,0x05,0x0A,0x15,0x2B,0x56,
++    0xAD,0x5B,0xB6,0x6D,0xDA,0xB5,0x6B,0xD6,0xAC,0x59,0xB2,0x65,0xCB,0x96,0x2C,0x58,
++    0xB0,0x61,0xC3,0x87,0x0F,0x1F,0x3E,0x7D,0xFB,0xF6,0xED,0xDB,0xB7,0x6F,0xDE,0xBD,
++    0x7A,0xF5,0xEB,0xD7,0xAE,0x5D,0xBA,0x74,0xE8,0xD1,0xA2,0x44,0x88,0x10,0x21,0x43,
++    0x86,0x0D,0x1B,0x36,0x6C,0xD8,0xB1,0x63,0xC7,0x8F,0x1E,0x3C,0x79,0xF3,0xE7,0xCE,
++    0x9C,0x39,0x73,0xE6,0xCC,0x98,0x31,0x62,0xC5,0x8B,0x16,0x2D,0x5A,0xB4,0x69,0xD2,
++    0xA4,0x48,0x91,0x22,0x45,0x8A,0x14,0x29,0x52,0xA5,0x4A,0x95,0x2A,0x54,0xA9,0x53,
++    0xA7,0x4E,0x9D,0x3B,0x77,0xEE,0xDD,0xBB,0x76,0xEC,0xD9,0xB3,0x67,0xCF,0x9E,0x3D,
++    0x7B,0xF7,0xEF,0xDF,0xBF,0x7E,0xFD,0xFA,0xF4,0xE9,0xD3,0xA6,0x4C,0x99,0x33,0x66,
++    0xCD,0x9A,0x35,0x6A,0xD4,0xA8,0x51,0xA3,0x46,0x8C,0x18,0x30,0x60,0xC1,0x83,0x07,
++    0x0E,0x1D,0x3A,0x75,0xEA,0xD5,0xAA,0x55,0xAB,0x57,0xAF,0x5F,0xBE,0x7C,0xF9,0xF2,
++    0xE5,0xCA,0x94,0x28,0x50,0xA1,0x42,0x84,0x09,0x13,0x27,0x4F,0x9F,0x3F,0x7F};
++
++static inline uint16_t crc16_ccitt(const uint8_t* d, int len) {
++    uint16_t crc = 0;
++    for (int i = 0; i < len; i++) {
++        uint8_t b = d[i];
++        for (int k = 0; k < 8; k++) {
++            if (((crc & 0x8000) >> 8) ^ (b & 0x80)) crc = (crc << 1) ^ 0x1021;
++            else crc = (crc << 1);
++            b <<= 1;
++        }
++    }
++    return crc;
++}
++
++static uint8_t hamming_hard(uint8_t cw, int cr_app) {
++    int cw_len = cr_app + 4;
++    bool c[8];
++    for (int i = 0; i < cw_len; i++) c[i] = (cw >> (cw_len - 1 - i)) & 1;
++    bool d[4] = {c[3], c[2], c[1], c[0]};
++    if (cr_app == 3 || cr_app == 4) {
++        bool doit = true;
++        if (cr_app == 4) {
++            int ones = 0;
++            for (int i = 0; i < cw_len; i++) ones += c[i];
++            if (!(ones % 2)) doit = false;   // parity ok, no correction
++        }
++        if (doit) {
++            bool s0 = c[0]^c[1]^c[2]^c[4];
++            bool s1 = c[1]^c[2]^c[3]^c[5];
++            bool s2 = c[0]^c[1]^c[3]^c[6];
++            int syn = s0 + (s1 << 1) + (s2 << 2);
++            if (syn == 5) d[3] = !d[3];
++            else if (syn == 7) d[2] = !d[2];
++            else if (syn == 3) d[1] = !d[1];
++            else if (syn == 6) d[0] = !d[0];
++        }
++    }
++    return (d[0] << 3) | (d[1] << 2) | (d[2] << 1) | d[3];
++}
++
++// ============================================================================
++// The demodulator
++// ============================================================================
++class Demod {
++public:
++    typedef void (*PacketCb)(const Packet&, void* user);
++
++    void init(int sf, int cr, bool has_crc, uint16_t sync_word,
++              PacketCb cb, void* user, uint32_t bw = 62500, uint32_t freq = 869618000) {
++        sf_ = sf; N_ = 1 << sf; sps_ = N_ * OS;
++        cr_ = cr; has_crc_ = has_crc;
++        bw_ = bw; freq_ = freq;
++        sync_words_[0] = ((sync_word & 0xF0) >> 4) << 3;
++        sync_words_[1] = (sync_word & 0x0F) << 3;
++        cb_ = cb; user_ = user;
++        fft_.init(sf + 1);   // one plan covers both N and 2N transforms
++
++        // reference chirps
++        build_upchirp(upchirp_, 0);
++        for (int i = 0; i < N_; i++) downchirp_[i] = cxconj(upchirp_[i]);
++
++        // Gray demap LUTs
++        for (int n = 0; n < N_; n++) {
++            uint32_t v = (n + N_ - 1) % N_;
++            demap_pay_[n] = v ^ (v >> 1);
++            uint32_t h = v / 4;
++            demap_hdr_[n] = h ^ (h >> 1);
++        }
++        reset();
++        rlen_ = 0; rhead_ = 0;
++    }
++
++    // Feed decimated complex samples (os per chip). Non-blocking.
++    // Pumps as the ring fills so no samples are ever silently overwritten,
++    // regardless of how large a block the caller passes.
++    void feed(const Cx* s, int n) {
++        int i = 0;
++        while (i < n) {
++            while (i < n && rlen_ < RING) {
++                ring_[(rhead_ + rlen_) % RING] = s[i++];
++                rlen_++;
++            }
++            pump();
++            // If the ring is full and pump() made no room (a rare stall while
++            // waiting on a header), drop one symbol to keep moving.
++            if (rlen_ >= RING) consume(sps_);
++        }
++    }
++
++private:
++    // ---- ring buffer: two symbols plus a little slack is all the pump needs ----
++    static constexpr int RING = MAX_SPS * 2 + 8 * OS;
++    Cx ring_[RING];
++    int rhead_ = 0, rlen_ = 0;
++    int processed_since_ = 0;
++
++    Cx at(int idx) const { return ring_[(rhead_ + idx) % RING]; }
++    void consume(int k) {
++        if (k > rlen_) k = rlen_;
++        rhead_ = (rhead_ + k) % RING; rlen_ -= k;
++    }
++
++    // ---- config ----
++    int sf_, N_, sps_, cr_;
++    uint32_t bw_, freq_;
++    bool has_crc_;
++    uint16_t sync_words_[2];
++    PacketCb cb_; void* user_;
++
++    // ---- tables/scratch ----
++    Cx upchirp_[MAX_N], downchirp_[MAX_N];
++    Cx demod_down_[MAX_N];
++    uint16_t demap_pay_[MAX_N], demap_hdr_[MAX_N];
++    Cx dech_[2 * MAX_N], fout_[2 * MAX_N];
++    float mag_[2 * MAX_N];
++    Cx in_down_[MAX_N], symb_[MAX_N], cfo_corr_[MAX_N];
++    Cx pre_raw_[PRE_SYMS * MAX_N];
++    Cx pre_up_[CFO_SYMS * MAX_N];
++    Cx cfo_fft_[CFO_SYMS * MAX_N];
++    Fft fft_;
++
++    // ---- frame-sync state (same fields as lora_rx) ----
++    enum State { DETECT, SYNC, PAYLOAD } state_;
++    int symbol_cnt_, preamb_[8], k_hat_, net_ids_[2], down_val_;
++    uint32_t bin_idx_;
++    float m_cfo_frac_, m_sto_frac_, sfo_hat_, sfo_cum_, cur_snr_;
++    int m_cfo_int_, additional_up_;
++    bool cfo_est_;
++    static constexpr int N_UP_REQ = 5, UP_USE = 4, PREAMBLE_LEN = 8;
++
++    // ---- payload decode state ----
++    int payload_sym_cnt_;
++    uint32_t total_payload_symbols_;
++    bool received_head_, ldro_, is_header_;
++    int pay_cr_; uint32_t pay_len_; bool pay_crc_;
++    double llr_block_[8][LORA_LITE_MAX_SF];
++    int llr_block_n_;
++    uint8_t nibbles_[2 * (LORA_LITE_MAX_PAYLOAD + 2) + 16];
++    int nib_n_;
++
++    void reset() {
++        state_ = DETECT; symbol_cnt_ = 1; bin_idx_ = 0; k_hat_ = 0;
++        m_sto_frac_ = m_cfo_frac_ = 0; m_cfo_int_ = 0; sfo_hat_ = sfo_cum_ = 0;
++        cfo_est_ = false; additional_up_ = 0; down_val_ = 0;
++        net_ids_[0] = net_ids_[1] = 0;
++        payload_sym_cnt_ = 0; total_payload_symbols_ = 0;
++        received_head_ = false; ldro_ = false; is_header_ = true;
++        llr_block_n_ = 0; nib_n_ = 0;
++    }
++
++    void build_upchirp(Cx* out, uint32_t id) {
++        double N = N_;
++        int nfold = (int)(N - id);
++        for (int n = 0; n < N_; n++) {
++            double ph = n < nfold
++                ? 2.0 * LORA_PI * (n * n / (2.0 * N) + ((double)id / N - 0.5) * n)
++                : 2.0 * LORA_PI * (n * n / (2.0 * N) + ((double)id / N - 1.5) * n);
++            out[n] = {(float)cos(ph), (float)sin(ph)};
++        }
++    }
++
++    void fftN(const Cx* in, Cx* out, int n) { fft_.run(in, out, n); }
++
++    uint32_t argmax_dechirp(const Cx* s, const Cx* ref) {
++        for (int i = 0; i < N_; i++) dech_[i] = cxmul(s[i], ref[i]);
++        fftN(dech_, fout_, N_);
++        float mx = -1, tot = 0; uint32_t mi = 0;
++        for (int i = 0; i < N_; i++) {
++            float m = cxnorm(fout_[i]); tot += m;
++            if (m > mx) { mx = m; mi = i; }
++        }
++        return tot > 0 ? mi : (uint32_t)-1;
++    }
++
++    static int most_frequent(const int* a, int n) {
++        int best = a[0], bc = 0;
++        for (int i = 0; i < n; i++) {
++            int c = 0;
++            for (int j = 0; j < n; j++) if (a[j] == a[i]) c++;
++            if (c > bc) { bc = c; best = a[i]; }
++        }
++        return best;
++    }
++
++    // ---- main pump: process whole symbols while enough samples are buffered ----
++    void pump() {
++        const int need = sps_ + 2 * OS;
++        while (rlen_ >= need) {
++            for (int ii = 0; ii < N_; ii++) {
++                long idx = OS / 2 + (long)OS * ii - lroundf(m_sto_frac_ * OS);
++                if (idx < 0) idx = 0;
++                if (idx >= rlen_) return;
++                in_down_[ii] = at((int)idx);
++            }
++            long consume_n = sps_;
++
++            if (state_ == DETECT) consume_n = do_detect();
++            else if (state_ == SYNC) consume_n = do_sync();
++            else consume_n = do_payload();
++
++            if (consume_n > 0 && consume_n <= rlen_) consume((int)consume_n);
++            else break;
++        }
++    }
++
++    long do_detect() {
++        uint32_t nb = argmax_dechirp(in_down_, downchirp_);
++        long consume_n = sps_;
++        if (labs(lmod(labs((long)nb - (long)bin_idx_) + 1, N_) - 1) <= 1 && nb != (uint32_t)-1) {
++            if (symbol_cnt_ == 1 && bin_idx_ != (uint32_t)-1) preamb_[0] = bin_idx_;
++            preamb_[symbol_cnt_] = nb;
++            memcpy(&pre_raw_[N_ * symbol_cnt_], in_down_, N_ * sizeof(Cx));
++            symbol_cnt_++;
++        } else {
++            memcpy(&pre_raw_[0], in_down_, N_ * sizeof(Cx));
++            symbol_cnt_ = 1;
++        }
++        bin_idx_ = nb;
++        if (symbol_cnt_ == N_UP_REQ) {
++            additional_up_ = 0; state_ = SYNC; symbol_cnt_ = 0; cfo_est_ = false;
++            k_hat_ = most_frequent(preamb_, N_UP_REQ);
++            consume_n = (long)OS * (N_ - k_hat_);
++        }
++        return consume_n;
++    }
++
++    long do_sync() {
++        if (!cfo_est_) {
++            estimate_cfo_frac(&pre_raw_[N_ - k_hat_]);
++            estimate_sto_frac();
++            for (int n = 0; n < N_; n++) {
++                float a = -2.0f * PI_F * m_cfo_frac_ / N_ * n;
++                cfo_corr_[n] = {cosf(a), sinf(a)};
++            }
++            cfo_est_ = true;
++        }
++        for (int i = 0; i < N_; i++) symb_[i] = cxmul(in_down_[i], cfo_corr_[i]);
++        bin_idx_ = argmax_dechirp(symb_, downchirp_);
++
++        switch (symbol_cnt_) {
++        case 0: // NET_ID1
++            if (bin_idx_ == 0 || bin_idx_ == 1 || (int)bin_idx_ == N_ - 1) {
++                if (additional_up_ < 3) additional_up_++;
++            } else { symbol_cnt_ = 1; net_ids_[0] = bin_idx_; }
++            break;
++        case 1: symbol_cnt_ = 2; net_ids_[1] = bin_idx_; break;   // NET_ID2
++        case 2: symbol_cnt_ = 3; break;                            // DOWNCHIRP1
++        case 3:                                                    // DOWNCHIRP2
++            down_val_ = argmax_dechirp(symb_, upchirp_);
++            symbol_cnt_ = 4; break;
++        case 4: return finish_sync();                              // QUARTER_DOWN
++        }
++        return sps_;
++    }
++
++    long finish_sync() {
++        if ((uint32_t)down_val_ < (uint32_t)N_ / 2) m_cfo_int_ = down_val_ / 2;
++        else m_cfo_int_ = (down_val_ - N_) / 2;
++
++        int nid0 = (int)lmod(net_ids_[0], N_);
++        uint8_t det_sync = (uint8_t)(((((nid0 + 4) >> 3) & 0xF) << 4) |
++                                     ((((int)lmod(net_ids_[1], N_) + 4) >> 3) & 0xF));
++        if (sync_words_[0] != 0 || sync_words_[1] != 0) {
++            long d = lmod(nid0 - sync_words_[0], N_);
++            long d2 = lmod(sync_words_[0] - nid0, N_);
++            if ((d < d2 ? d : d2) > 2) { reset(); return sps_; }
++        }
++        det_sync_ = det_sync;
++
++        // Per-symbol SFO drift rate (chips/symbol) from the TX/RX clock ratio.
++        // Applied incrementally in the payload loop; the larger one-shot
++        // m_sto_frac pre-load from gr-lora is omitted here as it interacts
++        // badly with lite's simpler preamble alignment (measured: fewer decodes).
++        sfo_hat_ = (float)(m_cfo_int_ + m_cfo_frac_) * (float)bw_ / (float)freq_;
++        sfo_cum_ = 0;
++
++        // demod downchirp with CFO correction
++        build_upchirp(demod_down_, lmod(m_cfo_int_, N_));
++        for (int i = 0; i < N_; i++) demod_down_[i] = cxconj(demod_down_[i]);
++        for (int n = 0; n < N_; n++) {
++            float a = -2.0f * PI_F * m_cfo_frac_ / N_ * n;
++            demod_down_[n] = cxmul(demod_down_[n], (Cx){cosf(a), sinf(a)});
++        }
++
++        // SNR from CFO-corrected preamble symbol
++        for (int i = 0; i < N_; i++) symb_[i] = cxmul(pre_raw_[i], cfo_corr_[i]);
++        for (int i = 0; i < N_; i++) dech_[i] = cxmul(symb_[i], downchirp_[i]);
++        fftN(dech_, fout_, N_);
++        float tot = 0, sig = 0;
++        for (int i = 0; i < N_; i++) { float m = cxnorm(fout_[i]); tot += m; if (m > sig) sig = m; }
++        cur_snr_ = (tot > sig && sig > 0) ? 10.0f * log10f(sig / (tot - sig)) : 0.0f;
++
++        state_ = PAYLOAD; payload_sym_cnt_ = 0; received_head_ = false; ldro_ = false;
++        llr_block_n_ = 0; nib_n_ = 0; is_header_ = true;
++        pay_cr_ = cr_; pay_len_ = LORA_LITE_MAX_PAYLOAD; pay_crc_ = has_crc_;
++
++        long consume_n = sps_ / 4 + (long)OS * m_cfo_int_;
++        if (consume_n < 0) consume_n = 0;
++        return consume_n;
++    }
++    uint8_t det_sync_ = 0;
++
++    void estimate_cfo_frac(const Cx* s) {
++        int k0v[UP_USE]; float k0m[UP_USE];
++        for (int i = 0; i < UP_USE; i++) {
++            for (int j = 0; j < N_; j++) dech_[j] = cxmul(s[N_ * i + j], downchirp_[j]);
++            fftN(dech_, &cfo_fft_[i * N_], N_);
++            float mx = -1; int mi = 0;
++            for (int j = 0; j < N_; j++) { float m = cxnorm(cfo_fft_[i * N_ + j]); if (m > mx) { mx = m; mi = j; } }
++            k0v[i] = mi; k0m[i] = mx;
++        }
++        int best = 0; for (int i = 1; i < UP_USE; i++) if (k0m[i] > k0m[best]) best = i;
++        int im = k0v[best];
++        Cx acc = {0, 0};
++        for (int i = 0; i < UP_USE - 1; i++)
++            acc = (Cx){acc.r + (cfo_fft_[im + N_ * i].r * cfo_fft_[im + N_ * (i + 1)].r + cfo_fft_[im + N_ * i].i * cfo_fft_[im + N_ * (i + 1)].i),
++                       acc.i + (cfo_fft_[im + N_ * i].i * cfo_fft_[im + N_ * (i + 1)].r - cfo_fft_[im + N_ * i].r * cfo_fft_[im + N_ * (i + 1)].i)};
++        m_cfo_frac_ = -atan2f(acc.i, acc.r) / (2.0f * PI_F);
++        for (int n = 0; n < UP_USE * N_; n++) {
++            float a = -2.0f * PI_F * m_cfo_frac_ / N_ * n;
++            pre_up_[n] = cxmul(s[n], (Cx){cosf(a), sinf(a)});
++        }
++    }
++
++    void estimate_sto_frac() {
++        int NN = 2 * N_;
++        for (int j = 0; j < NN; j++) mag_[j] = 0;
++        for (int i = 0; i < UP_USE; i++) {
++            for (int j = 0; j < N_; j++) dech_[j] = cxmul(pre_up_[N_ * i + j], downchirp_[j]);
++            for (int j = N_; j < NN; j++) dech_[j] = (Cx){0, 0};
++            fftN(dech_, fout_, NN);
++            for (int j = 0; j < NN; j++) mag_[j] += cxnorm(fout_[j]);
++        }
++        int k0 = 0; for (int j = 1; j < NN; j++) if (mag_[j] > mag_[k0]) k0 = j;
++        double Y_1 = mag_[lmod(k0 - 1, NN)], Y0 = mag_[k0], Y1 = mag_[lmod(k0 + 1, NN)];
++        double u = 64.0 * N_ / 406.5506497, v = u * 2.4674;
++        double wa = (Y1 - Y_1) / (u * (Y1 + Y_1) + v * Y0);
++        double ka = wa * N_ / LORA_PI;
++        double kr = fmod((k0 + ka) / 2.0, 1.0);
++        m_sto_frac_ = (float)(kr - (kr > 0.5 ? 1.0 : 0.0));
++    }
++
++    long do_payload() {
++        bool want = payload_sym_cnt_ < 8 ||
++                    ((uint32_t)payload_sym_cnt_ < total_payload_symbols_ && received_head_);
++        if (want) {
++            demod_symbol(in_down_);
++            long consume_n = sps_;
++            // SFO compensation: nudge the window by a sample when drift exceeds
++            // half a chip, keeping long payloads aligned.
++            if (fabsf(sfo_cum_) > 1.0f / 2.0f / OS) {
++                int sign = (sfo_cum_ >= 0) ? 1 : -1;
++                consume_n -= sign;
++                sfo_cum_ -= sign * 1.0f / OS;
++            }
++            sfo_cum_ += sfo_hat_;
++            payload_sym_cnt_++;
++            return consume_n;
++        } else if (!received_head_) {
++            return 0; // wait
++        } else {
++            reset();
++            return sps_;
++        }
++    }
++
++    void demod_symbol(const Cx* sym) {
++        int block = 4 + (is_header_ ? 4 : pay_cr_);
++        compute_llrs(sym, llr_block_[llr_block_n_]);
++        llr_block_n_++;
++        if (llr_block_n_ == block) { decode_block(); llr_block_n_ = 0; }
++    }
++
++    void compute_llrs(const Cx* sym, double* out) {
++        for (int i = 0; i < N_; i++) dech_[i] = cxmul(sym[i], demod_down_[i]);
++        fftN(dech_, fout_, N_);
++        for (int i = 0; i < N_; i++) mag_[i] = cxnorm(fout_[i]);
++        const uint16_t* map = (is_header_ || ldro_) ? demap_hdr_ : demap_pay_;
++        for (int i = 0; i < sf_; i++) {
++            float x1 = -1, x0 = -1;
++            for (int n = 0; n < N_; n++) {
++                if (map[n] & (1u << i)) { if (mag_[n] > x1) x1 = mag_[n]; }
++                else { if (mag_[n] > x0) x0 = mag_[n]; }
++            }
++            out[sf_ - 1 - i] = (double)x1 - (double)x0;
++        }
++    }
++
++    // soft Hamming over the LLR codeword
++    static const uint8_t* cwlut();
++    uint8_t hamming_soft(const double* llr, int cr_app) {
++        static const uint8_t LUT[16]     = {0,23,45,58,78,89,99,116,139,156,166,177,197,210,232,255};
++        static const uint8_t LUT5[16]    = {0,24,40,48,72,80,96,120,136,144,160,184,192,216,232,240};
++        int cw_len = cr_app + 4;
++        double best = -1e30; int bi = 0;
++        for (int n = 0; n < 16; n++) {
++            double p = 0;
++            for (int j = 0; j < cw_len; j++) {
++                bool bit = (((cr_app != 1) ? LUT[n] : LUT5[n]) >> (8 - cw_len)) & (1u << (cw_len - 1 - j));
++                double a = llr[j] < 0 ? -llr[j] : llr[j];
++                if ((bit && llr[j] > 0) || (!bit && llr[j] < 0)) p += a; else p -= a;
++            }
++            if (p > best) { best = p; bi = n; }
++        }
++        uint8_t d = LUT[bi] >> 4;
++        return ((d & 1) << 3) | (((d >> 1) & 1) << 2) | (((d >> 2) & 1) << 1) | ((d >> 3) & 1);
++    }
++
++    void decode_block() {
++        int sf_app = (is_header_ || ldro_) ? sf_ - 2 : sf_;
++        int cw_len = is_header_ ? 8 : pay_cr_ + 4;
++        int cr_app = is_header_ ? 4 : pay_cr_;
++        double deinter[LORA_LITE_MAX_SF][8];
++        for (int i = 0; i < cw_len; i++)
++            for (int j = 0; j < sf_app; j++)
++                deinter[lmod(i - j - 1, sf_app)][i] = llr_block_[i][sf_ - sf_app + j];
++        for (int i = 0; i < sf_app; i++) {
++            if (nib_n_ < (int)sizeof(nibbles_))
++                nibbles_[nib_n_++] = hamming_soft(deinter[i], cr_app);
++        }
++        process_nibbles();
++    }
++
++    void process_nibbles() {
++        if (is_header_ && nib_n_ >= 5) {
++            pay_len_ = (nibbles_[0] << 4) | nibbles_[1];
++            pay_crc_ = nibbles_[2] & 1;
++            pay_cr_ = nibbles_[2] >> 1;
++            if (pay_cr_ < 1) pay_cr_ = 1; if (pay_cr_ > 4) pay_cr_ = 4;
++            uint8_t chk = ((nibbles_[3] & 1) << 4) | nibbles_[4];
++            uint8_t n0 = nibbles_[0], n1 = nibbles_[1], n2 = nibbles_[2];
++            auto b = [](uint8_t v, int k) { return (v >> k) & 1; };
++            int c4 = b(n0,3)^b(n0,2)^b(n0,1)^b(n0,0);
++            int c3 = b(n0,3)^b(n1,3)^b(n1,2)^b(n1,1)^b(n2,0);
++            int c2 = b(n0,2)^b(n1,3)^b(n1,0)^b(n2,3)^b(n2,1);
++            int c1 = b(n0,1)^b(n1,2)^b(n1,0)^b(n2,2)^b(n2,1)^b(n2,0);
++            int c0 = b(n0,0)^b(n1,1)^b(n2,3)^b(n2,2)^b(n2,1)^b(n2,0);
++            int comp = (c4<<4)|(c3<<3)|(c2<<2)|(c1<<1)|c0;
++            if (comp != chk || pay_len_ == 0 || pay_len_ > LORA_LITE_MAX_PAYLOAD) { reset(); return; }
++            // Low Data Rate Optimize engages when a symbol lasts > 16 ms
++            ldro_ = ((float)(1u << sf_) * 1e3f / (float)bw_) > 16.0f;
++            int sf2 = sf_ - 2 * (ldro_ ? 1 : 0);
++            total_payload_symbols_ = 8 + ((int)ceilf((2.0f * pay_len_ - sf_ + 2 + 5 + (pay_crc_ ? 4 : 0)) / sf2)) * (4 + pay_cr_);
++            received_head_ = true; is_header_ = false;
++            // drop 5 header nibbles
++            for (int i = 5; i < nib_n_; i++) nibbles_[i - 5] = nibbles_[i];
++            nib_n_ -= 5;
++        }
++        uint32_t need = pay_len_ * 2 + (pay_crc_ ? 4 : 0);
++        if (!is_header_ && (uint32_t)nib_n_ >= need) emit();
++    }
++
++    void emit() {
++        Packet pkt;
++        int total = pay_len_ + (pay_crc_ ? 2 : 0);
++        uint8_t bytes[LORA_LITE_MAX_PAYLOAD + 2];
++        for (int i = 0; i < total; i++) {
++            uint8_t lo = nibbles_[2 * i], hi = nibbles_[2 * i + 1];
++            if ((uint32_t)i < pay_len_) { lo ^= WHITEN[i] & 0x0F; hi ^= (WHITEN[i] >> 4) & 0x0F; }
++            bytes[i] = (hi << 4) | lo;
++        }
++        for (uint32_t i = 0; i < pay_len_; i++) pkt.data[i] = bytes[i];
++        pkt.len = pay_len_; pkt.has_crc = pay_crc_; pkt.snr = cur_snr_;
++        pkt.cfo = m_cfo_int_ + m_cfo_frac_; pkt.sync = det_sync_;
++        pkt.crc_ok = true;
++        if (pay_crc_ && pay_len_ >= 2) {
++            uint16_t calc = crc16_ccitt(bytes, pay_len_ - 2);
++            calc ^= bytes[pay_len_ - 1] ^ ((uint16_t)bytes[pay_len_ - 2] << 8);
++            uint16_t rx = bytes[pay_len_] | ((uint16_t)bytes[pay_len_ + 1] << 8);
++            pkt.crc_ok = (calc == rx);
++        }
++        if (cb_) cb_(pkt, user_);
++        nib_n_ = 0;
++        reset();
++    }
++};
++
++} // namespace lora_lite
+diff --git a/firmware/baseband/proc_lorarx.cpp b/firmware/baseband/proc_lorarx.cpp
+new file mode 100644
+index 0000000..47825a1
+--- /dev/null
++++ b/firmware/baseband/proc_lorarx.cpp
+@@ -0,0 +1,82 @@
++/*
++ * Copyright (C) 2026 (LoRa RX app)
++ *
++ * This file is part of PortaPack.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#include "proc_lorarx.hpp"
++#include "portapack_shared_memory.hpp"
++#include "event_m4.hpp"
++
++#include <cstddef>
++
++void LoRaRxProcessor::execute(const buffer_c8_t& buffer) {
++    if (!configured) return;
++
++    // 2048 complex8 in -> /4 -> 512 -> /2 -> 256 complex16 out (os=4 @ bw)
++    const auto decim_0_out = decim_0.execute(buffer, dst_buffer);
++    const auto decim_1_out = decim_1.execute(decim_0_out, dst_buffer);
++    feed_channel_stats(decim_1_out);
++
++    const size_t n = decim_1_out.count;
++    for (size_t i = 0; i < n && i < cx_buf.size(); i++) {
++        // complex16 -> normalized float, matching the host core's scaling
++        cx_buf[i].r = (float)decim_1_out.p[i].real() * (1.0f / 32768.0f);
++        cx_buf[i].i = (float)decim_1_out.p[i].imag() * (1.0f / 32768.0f);
++    }
++    demod.feed(cx_buf.data(), (int)(n < cx_buf.size() ? n : cx_buf.size()));
++}
++
++void LoRaRxProcessor::packet_callback(const lora_lite::Packet& p, void* /*user*/) {
++    auto& pd = *reinterpret_cast<LoRaPacketData*>(shared_memory.bb_data.data);
++    pd.len = p.len;
++    pd.crc_ok = p.crc_ok ? 1 : 0;
++    pd.has_crc = p.has_crc ? 1 : 0;
++    pd.sync = p.sync;
++    pd.snr = p.snr;
++    pd.cfo = p.cfo;
++    for (uint8_t i = 0; i < p.len && i < sizeof(pd.data); i++) pd.data[i] = p.data[i];
++
++    LoRaRxPacketMessage message{&pd};
++    shared_memory.application_queue.push(message);
++}
++
++void LoRaRxProcessor::on_message(const Message* const message) {
++    switch (message->id) {
++        case Message::ID::LoRaRxConfigure:
++            configure(*reinterpret_cast<const LoRaRxConfigureMessage*>(message));
++            break;
++        default:
++            break;
++    }
++}
++
++void LoRaRxProcessor::configure(const LoRaRxConfigureMessage& message) {
++    baseband_fs = message.bandwidth * LORA_LITE_OS * 8;  // /8 decimation chain
++    baseband_thread.set_sampling_rate(baseband_fs);
++
++    decim_0.configure(taps_200k_wfm_decim_0.taps);
++    decim_1.configure(taps_200k_wfm_decim_1.taps);
++
++    demod.init(message.sf, message.cr, message.has_crc != 0, message.sync_word,
++               &LoRaRxProcessor::packet_callback, this,
++               message.bandwidth, 869618000);
++
++    configured = true;
++}
++
++int main() {
++    EventDispatcher event_dispatcher{std::make_unique<LoRaRxProcessor>()};
++    event_dispatcher.run();
++    return 0;
++}
+diff --git a/firmware/baseband/proc_lorarx.hpp b/firmware/baseband/proc_lorarx.hpp
+new file mode 100644
+index 0000000..2fc27cb
+--- /dev/null
++++ b/firmware/baseband/proc_lorarx.hpp
+@@ -0,0 +1,61 @@
++/*
++ * Copyright (C) 2026 (LoRa RX app)
++ *
++ * This file is part of PortaPack.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef __PROC_LORARX_H__
++#define __PROC_LORARX_H__
++
++#include "baseband_processor.hpp"
++#include "baseband_thread.hpp"
++#include "rssi_thread.hpp"
++#include "message.hpp"
++#include "dsp_decimate.hpp"
++
++// The portable, no-malloc LoRa demodulator core (verified on real captures).
++#define LORA_LITE_OS 4
++#define LORA_LITE_MAX_SF 8
++#define LORA_LITE_MAX_PAYLOAD 64
++#include "lora_lite.h"
++
++// Baseband: SR = bw * os * 8. For bw = 62.5 kHz -> 2.0 MHz in, /8 -> 250 kHz
++// (os = 4). Two-stage FIR decimation (same filters as the weather proc).
++class LoRaRxProcessor : public BasebandProcessor {
++   public:
++    void execute(const buffer_c8_t& buffer) override;
++    void on_message(const Message* const message) override;
++
++   private:
++    static void packet_callback(const lora_lite::Packet& p, void* user);
++    void configure(const LoRaRxConfigureMessage& message);
++
++    bool configured{false};
++    size_t baseband_fs = 0;
++
++    // /4 then /2 = /8 total, identical to proc_weather
++    std::array<complex16_t, 512> dst{};
++    const buffer_c16_t dst_buffer{dst.data(), dst.size()};
++    dsp::decimate::FIRC8xR16x24FS4Decim4 decim_0{};
++    dsp::decimate::FIRC16xR16x16Decim2 decim_1{};
++
++    // Scratch for the float conversion handed to the core.
++    std::array<lora_lite::Cx, 256> cx_buf{};
++
++    lora_lite::Demod demod{};
++
++    BasebandThread baseband_thread{baseband_fs, this, baseband::Direction::Receive};
++    RSSIThread rssi_thread{};
++};
++
++#endif /*__PROC_LORARX_H__*/
+diff --git a/firmware/common/message.hpp b/firmware/common/message.hpp
+index 818c8d3..09ffe34 100644
+--- a/firmware/common/message.hpp
++++ b/firmware/common/message.hpp
+@@ -170,6 +170,8 @@ class Message {
+         HunterStop = 112,
+         TetraBsch = 113,
+         TetraDnb = 114,
++        LoRaRxConfigure = 115,
++        LoRaRxPacket = 116,
+         MAX
+     };
+ 
+@@ -556,6 +558,41 @@ class FSKRxPacketMessage : public Message {
+     FskPacketData* packet{nullptr};
+ };
+ 
++// ---- LoRa RX (lora_lite core) ----
++class LoRaRxConfigureMessage : public Message {
++   public:
++    constexpr LoRaRxConfigureMessage(
++        uint8_t sf, uint8_t cr, uint8_t has_crc, uint16_t sync_word, uint32_t bandwidth)
++        : Message{ID::LoRaRxConfigure},
++          sf{sf}, cr{cr}, has_crc{has_crc}, sync_word{sync_word}, bandwidth{bandwidth} {
++    }
++    uint8_t sf;
++    uint8_t cr;
++    uint8_t has_crc;
++    uint16_t sync_word;
++    uint32_t bandwidth;
++};
++
++// A decoded LoRa packet passed M4 -> M0. Kept POD and self-contained so it can
++// live in the shared message queue.
++struct LoRaPacketData {
++    uint8_t data[64];
++    uint8_t len;
++    uint8_t crc_ok;
++    uint8_t has_crc;
++    uint8_t sync;
++    float snr;
++    float cfo;
++};
++
++class LoRaRxPacketMessage : public Message {
++   public:
++    constexpr LoRaRxPacketMessage(LoRaPacketData* packet)
++        : Message{ID::LoRaRxPacket}, packet{packet} {
++    }
++    LoRaPacketData* packet{nullptr};
++};
++
+ class CodedSquelchMessage : public Message {
+    public:
+     constexpr CodedSquelchMessage(
+diff --git a/firmware/common/spi_image.hpp b/firmware/common/spi_image.hpp
+index 844af06..4661452 100644
+--- a/firmware/common/spi_image.hpp
++++ b/firmware/common/spi_image.hpp
+@@ -120,6 +120,7 @@ constexpr image_tag_t image_tag_tones{'P', 'T', 'O', 'N'};
+ constexpr image_tag_t image_tag_flash_utility{'P', 'F', 'U', 'T'};
+ constexpr image_tag_t image_tag_usb_sd{'P', 'U', 'S', 'B'};
+ 
++constexpr image_tag_t image_tag_lorarx{'P', 'L', 'O', 'R'};
+ constexpr image_tag_t image_tag_weather{'P', 'W', 'T', 'H'};
+ constexpr image_tag_t image_tag_subghzd{'P', 'S', 'G', 'D'};
+ constexpr image_tag_t image_tag_subcar{'P', 'S', 'C', 'D'};
+-- 
+2.50.1 (Apple Git-155)
+
