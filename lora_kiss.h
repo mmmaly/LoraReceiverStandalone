@@ -19,9 +19,9 @@ public:
         maxlog_ = max_log2;
         int maxN = 1 << max_log2;
         for (int i = 0; i < maxN; i++) {
-            double a = -2.0 * LORA_PI * i / maxN;   // full-size twiddles; subsampled per stage
-            tw_[i][0] = (float)cos(a);
-            tw_[i][1] = (float)sin(a);
+            float a = (float)(-2.0 * LORA_PI * i / maxN);  // twiddles; subsampled per stage
+            tw_[i][0] = cosf(a);
+            tw_[i][1] = sinf(a);
         }
         maxN_ = maxN;
     }
