@@ -24,7 +24,9 @@
 //     -I                Implicit header mode
 //     -L <pay_len>      Payload length for implicit header (default 11)
 //     -A                Auto-scan: run all SF (7-12) and BW combinations in parallel
-//     -r <file>         Read IQ from file (rtl_sdr u8 format, "-" = stdin) instead of SDR
+//     -r <file>         Read IQ from file (rtl_sdr u8 format, "-" = stdin) instead of SDR;
+//                       .C16 files are read as PortaPack int16 IQ, with tuner freq and
+//                       sample rate defaulted from the Mayhem .TXT sidecar
 //     -D <file>         Dump raw IQ to file while receiving (for later replay with -r)
 
 #include <cstdio>
@@ -43,6 +45,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <string>
+#include <strings.h>
 #include <getopt.h>
 #include <rtl-sdr.h>
 
@@ -1625,22 +1628,8 @@ struct ChannelFanout {
 };
 static std::vector<ChannelFanout> g_channels;
 
-static void broadcast_u8(const unsigned char *buf, uint32_t len) {
-    if (g_dump && fwrite(buf, 1, len, g_dump) != len) {
-        // Disk full or write error: a silently truncated dump is worse than
-        // no dump. Warn, stop dumping, keep receiving.
-        fprintf(stderr, "Warning: IQ dump write failed (disk full?) - dump disabled, reception continues\n");
-        fclose(g_dump);
-        g_dump = nullptr;
-    }
-
-    size_t n = len / 2;
-    auto base = std::make_shared<std::vector<cx>>(n);
-    {
-        auto &v = *base;
-        for (size_t i = 0; i < n; i++)
-            v[i] = cx(g_u8lut[buf[2 * i]], g_u8lut[buf[2 * i + 1]]);
-    }
+static void broadcast_cx(std::shared_ptr<const std::vector<cx>> base) {
+    size_t n = base->size();
 
     for (auto &ch : g_channels) {
         std::shared_ptr<const std::vector<cx>> chunk;
@@ -1663,6 +1652,68 @@ static void broadcast_u8(const unsigned char *buf, uint32_t len) {
         }
         for (auto *w : ch.workers)
             w->push(chunk);
+    }
+}
+
+static void broadcast_u8(const unsigned char *buf, uint32_t len) {
+    if (g_dump && fwrite(buf, 1, len, g_dump) != len) {
+        // Disk full or write error: a silently truncated dump is worse than
+        // no dump. Warn, stop dumping, keep receiving.
+        fprintf(stderr, "Warning: IQ dump write failed (disk full?) - dump disabled, reception continues\n");
+        fclose(g_dump);
+        g_dump = nullptr;
+    }
+
+    size_t n = len / 2;
+    auto base = std::make_shared<std::vector<cx>>(n);
+    {
+        auto &v = *base;
+        for (size_t i = 0; i < n; i++)
+            v[i] = cx(g_u8lut[buf[2 * i]], g_u8lut[buf[2 * i + 1]]);
+    }
+    broadcast_cx(std::move(base));
+}
+
+// PortaPack/Mayhem C16 capture: interleaved little-endian int16 I/Q. Values
+// go straight to float, so no rescaling is needed regardless of how little of
+// the int16 range the capture uses (the demod is scale-invariant).
+static void broadcast_s16(const int16_t *buf, size_t n_vals) {
+    size_t n = n_vals / 2;
+    auto base = std::make_shared<std::vector<cx>>(n);
+    {
+        auto &v = *base;
+        for (size_t i = 0; i < n; i++)
+            v[i] = cx(buf[2 * i] / 32768.0f, buf[2 * i + 1] / 32768.0f);
+    }
+    broadcast_cx(std::move(base));
+}
+
+static bool is_c16_file(const char *path) {
+    size_t l = strlen(path);
+    return l > 4 && strcasecmp(path + l - 4, ".c16") == 0;
+}
+
+// Mayhem writes a metadata sidecar next to each C16 capture. Use it to
+// default the tuner frequency and sample rate so a bare
+// `lora_rx -r BBD_0000.C16 -S 8` replays correctly; explicit -f/-s still win.
+static void load_c16_sidecar(const char *path, LoRaConfig &cfg,
+                             bool &freq_given, bool &samp_given) {
+    std::string base(path, strlen(path) - 4);
+    for (const char *ext : {".TXT", ".txt"}) {
+        FILE *f = fopen((base + ext).c_str(), "r");
+        if (!f) continue;
+        char line[128];
+        unsigned long freq = 0, rate = 0, v;
+        while (fgets(line, sizeof(line), f)) {
+            if (sscanf(line, "center_frequency=%lu", &v) == 1) freq = v;
+            else if (sscanf(line, "sample_rate=%lu", &v) == 1) rate = v;
+        }
+        fclose(f);
+        fprintf(stderr, "C16 sidecar %s%s:", base.c_str(), ext);
+        if (freq && !freq_given) { cfg.freq = (uint32_t)freq; freq_given = true; fprintf(stderr, " freq=%lu", freq); }
+        if (rate && !samp_given) { cfg.samp_rate = (uint32_t)rate; samp_given = true; fprintf(stderr, " samp_rate=%lu", rate); }
+        fprintf(stderr, "\n");
+        return;
     }
 }
 
@@ -1732,10 +1783,17 @@ int main(int argc, char *argv[]) {
                             "          [-w sync_word_hex] [-g gain] [-G] [-p ppm] [-I] [-L pay_len] [-A]\n"
                             "          [-C chan_freq[,chan_freq..]] [-r iq_file] [-D dump_file]\n"
                             "  -G enables the RTL2832 internal digital AGC\n"
-                            "  -T enables the R820T analog tuner AGC (overrides -g)\n", argv[0]);
+                            "  -T enables the R820T analog tuner AGC (overrides -g)\n"
+                            "  -r accepts rtl_sdr u8 IQ; a .C16 file is read as PortaPack int16 IQ,\n"
+                            "     with tuner freq / sample rate defaulted from its Mayhem .TXT sidecar\n", argv[0]);
             return 1;
         }
     }
+
+    // PortaPack C16 replay: pick up the capture's own frequency and rate
+    // before any derived configuration is computed
+    if (iq_file && is_c16_file(iq_file))
+        load_c16_sidecar(iq_file, cfg, freq_given, samp_given);
 
     for (long sf : sfs_cli) {
         if (sf < MIN_SF || sf > MAX_SF) {
@@ -1874,18 +1932,28 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
 
     if (iq_file) {
-        // ---- Offline: replay IQ from file (rtl_sdr u8 format) ----
+        // ---- Offline: replay IQ from file (rtl_sdr u8, or PortaPack C16) ----
+        bool c16 = is_c16_file(iq_file);
         FILE *f = strcmp(iq_file, "-") == 0 ? stdin : fopen(iq_file, "rb");
         if (!f) {
             perror("iq file");
             finish_workers();
             return 1;
         }
-        fprintf(stderr, "Replaying IQ from %s...\n\n", iq_file);
-        std::vector<unsigned char> buf(1 << 18);
-        size_t nr;
-        while (g_running && (nr = fread(buf.data(), 1, buf.size(), f)) > 0)
-            broadcast_u8(buf.data(), (uint32_t)nr);
+        if (c16 && g_dump)
+            fprintf(stderr, "Warning: -D writes u8 and is ignored for C16 replay\n");
+        fprintf(stderr, "Replaying %s IQ from %s...\n\n", c16 ? "C16" : "u8", iq_file);
+        if (c16) {
+            std::vector<int16_t> sbuf(1 << 17);
+            size_t nr;
+            while (g_running && (nr = fread(sbuf.data(), sizeof(int16_t), sbuf.size(), f)) > 0)
+                broadcast_s16(sbuf.data(), nr);
+        } else {
+            std::vector<unsigned char> buf(1 << 18);
+            size_t nr;
+            while (g_running && (nr = fread(buf.data(), 1, buf.size(), f)) > 0)
+                broadcast_u8(buf.data(), (uint32_t)nr);
+        }
         if (f != stdin) fclose(f);
     } else {
         // ---- Live: RTL-SDR ----

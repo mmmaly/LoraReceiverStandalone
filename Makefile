@@ -20,7 +20,7 @@ SRCS_CXX = lora_rx.cpp
 SRCS_C   = kiss_fft.c
 OBJS     = $(SRCS_CXX:.cpp=.o) $(SRCS_C:.c=.o)
 
-all: $(TARGET)
+all: $(TARGET) $(TXGEN)
 
 $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
