@@ -50,15 +50,23 @@ static inline Cx cxconj(Cx a) { return {a.r, -a.i}; }
 static inline float cxnorm(Cx a) { return a.r * a.r + a.i * a.i; }
 static inline long lmod(long a, long b) { return ((a % b) + b) % b; }
 
-// Decoded packet handed to the caller.
+// Decoded packet (or detection) handed to the caller.
+enum PacketStatus : uint8_t {
+    PKT_HEADER_ONLY = 0,  // valid header decoded; payload not yet/never assembled
+    PKT_CRC_FAIL    = 1,  // full payload assembled but CRC failed
+    PKT_DECODED     = 2,  // full payload assembled, CRC valid (or no CRC)
+};
+
 struct Packet {
     uint8_t  data[LORA_LITE_MAX_PAYLOAD];
-    uint8_t  len;
+    uint8_t  len;         // payload bytes present in data[] (0 for header-only)
+    uint8_t  hdr_len;     // payload length declared by the header
+    uint8_t  status;      // PacketStatus
     bool     crc_ok;
     bool     has_crc;
     float    snr;
-    float    cfo;      // in bins
-    uint8_t  sync;     // detected sync word
+    float    cfo;         // in bins
+    uint8_t  sync;        // detected sync word
 };
 
 // ---- Hamming / whitening / CRC tables (shared with lora_rx) ----
@@ -93,31 +101,8 @@ static inline uint16_t crc16_ccitt(const uint8_t* d, int len) {
     return crc;
 }
 
-static uint8_t hamming_hard(uint8_t cw, int cr_app) {
-    int cw_len = cr_app + 4;
-    bool c[8];
-    for (int i = 0; i < cw_len; i++) c[i] = (cw >> (cw_len - 1 - i)) & 1;
-    bool d[4] = {c[3], c[2], c[1], c[0]};
-    if (cr_app == 3 || cr_app == 4) {
-        bool doit = true;
-        if (cr_app == 4) {
-            int ones = 0;
-            for (int i = 0; i < cw_len; i++) ones += c[i];
-            if (!(ones % 2)) doit = false;   // parity ok, no correction
-        }
-        if (doit) {
-            bool s0 = c[0]^c[1]^c[2]^c[4];
-            bool s1 = c[1]^c[2]^c[3]^c[5];
-            bool s2 = c[0]^c[1]^c[3]^c[6];
-            int syn = s0 + (s1 << 1) + (s2 << 2);
-            if (syn == 5) d[3] = !d[3];
-            else if (syn == 7) d[2] = !d[2];
-            else if (syn == 3) d[1] = !d[1];
-            else if (syn == 6) d[0] = !d[0];
-        }
-    }
-    return (d[0] << 3) | (d[1] << 2) | (d[2] << 1) | d[3];
-}
+// (A hard-decision Hamming decoder lived here; lora_lite uses only the soft
+//  path, so it was removed to keep the M4 baseband image within its 32 KiB.)
 
 // ============================================================================
 // The demodulator
@@ -197,7 +182,6 @@ private:
     Cx in_down_[MAX_N], symb_[MAX_N], cfo_corr_[MAX_N];
     Cx pre_raw_[PRE_SYMS * MAX_N];
     Cx pre_up_[CFO_SYMS * MAX_N];
-    Cx cfo_fft_[CFO_SYMS * MAX_N];
     Fft fft_;
 
     // ---- frame-sync state (same fields as lora_rx) ----
@@ -214,7 +198,7 @@ private:
     uint32_t total_payload_symbols_;
     bool received_head_, ldro_, is_header_;
     int pay_cr_; uint32_t pay_len_; bool pay_crc_;
-    double llr_block_[8][LORA_LITE_MAX_SF];
+    float llr_block_[8][LORA_LITE_MAX_SF];
     int llr_block_n_;
     uint8_t nibbles_[2 * (LORA_LITE_MAX_PAYLOAD + 2) + 16];
     int nib_n_;
@@ -230,13 +214,13 @@ private:
     }
 
     void build_upchirp(Cx* out, uint32_t id) {
-        double N = N_;
+        float N = N_;
         int nfold = (int)(N - id);
         for (int n = 0; n < N_; n++) {
-            double ph = n < nfold
-                ? 2.0 * LORA_PI * (n * n / (2.0 * N) + ((double)id / N - 0.5) * n)
-                : 2.0 * LORA_PI * (n * n / (2.0 * N) + ((double)id / N - 1.5) * n);
-            out[n] = {(float)cos(ph), (float)sin(ph)};
+            float ph = n < nfold
+                ? 2.0 * LORA_PI * (n * n / (2.0 * N) + ((float)id / N - 0.5) * n)
+                : 2.0 * LORA_PI * (n * n / (2.0 * N) + ((float)id / N - 1.5) * n);
+            out[n] = {cosf((float)ph), sinf((float)ph)};
         }
     }
 
@@ -348,10 +332,7 @@ private:
         }
         det_sync_ = det_sync;
 
-        // Per-symbol SFO drift rate (chips/symbol) from the TX/RX clock ratio.
-        // Applied incrementally in the payload loop; the larger one-shot
-        // m_sto_frac pre-load from gr-lora is omitted here as it interacts
-        // badly with lite's simpler preamble alignment (measured: fewer decodes).
+        // Per-symbol SFO drift rate; applied incrementally in the payload loop.
         sfo_hat_ = (float)(m_cfo_int_ + m_cfo_frac_) * (float)bw_ / (float)freq_;
         sfo_cum_ = 0;
 
@@ -382,20 +363,30 @@ private:
     uint8_t det_sync_ = 0;
 
     void estimate_cfo_frac(const Cx* s) {
+        // Pass 1: find each preamble symbol's peak bin (FFT into scratch).
         int k0v[UP_USE]; float k0m[UP_USE];
         for (int i = 0; i < UP_USE; i++) {
             for (int j = 0; j < N_; j++) dech_[j] = cxmul(s[N_ * i + j], downchirp_[j]);
-            fftN(dech_, &cfo_fft_[i * N_], N_);
+            fftN(dech_, fout_, N_);
             float mx = -1; int mi = 0;
-            for (int j = 0; j < N_; j++) { float m = cxnorm(cfo_fft_[i * N_ + j]); if (m > mx) { mx = m; mi = j; } }
+            for (int j = 0; j < N_; j++) { float m = cxnorm(fout_[j]); if (m > mx) { mx = m; mi = j; } }
             k0v[i] = mi; k0m[i] = mx;
         }
         int best = 0; for (int i = 1; i < UP_USE; i++) if (k0m[i] > k0m[best]) best = i;
         int im = k0v[best];
+        // Pass 2: recompute the FFTs and keep only the value at bin `im`.
+        // (Recomputing is cheaper in RAM than storing every symbol's FFT, and
+        //  only runs once per frame at sync.)
+        Cx binval[UP_USE];
+        for (int i = 0; i < UP_USE; i++) {
+            for (int j = 0; j < N_; j++) dech_[j] = cxmul(s[N_ * i + j], downchirp_[j]);
+            fftN(dech_, fout_, N_);
+            binval[i] = fout_[im];
+        }
         Cx acc = {0, 0};
         for (int i = 0; i < UP_USE - 1; i++)
-            acc = (Cx){acc.r + (cfo_fft_[im + N_ * i].r * cfo_fft_[im + N_ * (i + 1)].r + cfo_fft_[im + N_ * i].i * cfo_fft_[im + N_ * (i + 1)].i),
-                       acc.i + (cfo_fft_[im + N_ * i].i * cfo_fft_[im + N_ * (i + 1)].r - cfo_fft_[im + N_ * i].r * cfo_fft_[im + N_ * (i + 1)].i)};
+            acc = (Cx){acc.r + (binval[i].r * binval[i + 1].r + binval[i].i * binval[i + 1].i),
+                       acc.i + (binval[i].i * binval[i + 1].r - binval[i].r * binval[i + 1].i)};
         m_cfo_frac_ = -atan2f(acc.i, acc.r) / (2.0f * PI_F);
         for (int n = 0; n < UP_USE * N_; n++) {
             float a = -2.0f * PI_F * m_cfo_frac_ / N_ * n;
@@ -413,11 +404,11 @@ private:
             for (int j = 0; j < NN; j++) mag_[j] += cxnorm(fout_[j]);
         }
         int k0 = 0; for (int j = 1; j < NN; j++) if (mag_[j] > mag_[k0]) k0 = j;
-        double Y_1 = mag_[lmod(k0 - 1, NN)], Y0 = mag_[k0], Y1 = mag_[lmod(k0 + 1, NN)];
-        double u = 64.0 * N_ / 406.5506497, v = u * 2.4674;
-        double wa = (Y1 - Y_1) / (u * (Y1 + Y_1) + v * Y0);
-        double ka = wa * N_ / LORA_PI;
-        double kr = fmod((k0 + ka) / 2.0, 1.0);
+        float Y_1 = mag_[lmod(k0 - 1, NN)], Y0 = mag_[k0], Y1 = mag_[lmod(k0 + 1, NN)];
+        float u = 64.0 * N_ / 406.5506497, v = u * 2.4674;
+        float wa = (Y1 - Y_1) / (u * (Y1 + Y_1) + v * Y0);
+        float ka = wa * N_ / LORA_PI;
+        float kr = fmodf((k0 + ka) / 2.0, 1.0);
         m_sto_frac_ = (float)(kr - (kr > 0.5 ? 1.0 : 0.0));
     }
 
@@ -452,7 +443,7 @@ private:
         if (llr_block_n_ == block) { decode_block(); llr_block_n_ = 0; }
     }
 
-    void compute_llrs(const Cx* sym, double* out) {
+    void compute_llrs(const Cx* sym, float* out) {
         for (int i = 0; i < N_; i++) dech_[i] = cxmul(sym[i], demod_down_[i]);
         fftN(dech_, fout_, N_);
         for (int i = 0; i < N_; i++) mag_[i] = cxnorm(fout_[i]);
@@ -463,22 +454,22 @@ private:
                 if (map[n] & (1u << i)) { if (mag_[n] > x1) x1 = mag_[n]; }
                 else { if (mag_[n] > x0) x0 = mag_[n]; }
             }
-            out[sf_ - 1 - i] = (double)x1 - (double)x0;
+            out[sf_ - 1 - i] = (float)x1 - (float)x0;
         }
     }
 
     // soft Hamming over the LLR codeword
     static const uint8_t* cwlut();
-    uint8_t hamming_soft(const double* llr, int cr_app) {
+    uint8_t hamming_soft(const float* llr, int cr_app) {
         static const uint8_t LUT[16]     = {0,23,45,58,78,89,99,116,139,156,166,177,197,210,232,255};
         static const uint8_t LUT5[16]    = {0,24,40,48,72,80,96,120,136,144,160,184,192,216,232,240};
         int cw_len = cr_app + 4;
-        double best = -1e30; int bi = 0;
+        float best = -1e30; int bi = 0;
         for (int n = 0; n < 16; n++) {
-            double p = 0;
+            float p = 0;
             for (int j = 0; j < cw_len; j++) {
                 bool bit = (((cr_app != 1) ? LUT[n] : LUT5[n]) >> (8 - cw_len)) & (1u << (cw_len - 1 - j));
-                double a = llr[j] < 0 ? -llr[j] : llr[j];
+                float a = llr[j] < 0 ? -llr[j] : llr[j];
                 if ((bit && llr[j] > 0) || (!bit && llr[j] < 0)) p += a; else p -= a;
             }
             if (p > best) { best = p; bi = n; }
@@ -491,7 +482,7 @@ private:
         int sf_app = (is_header_ || ldro_) ? sf_ - 2 : sf_;
         int cw_len = is_header_ ? 8 : pay_cr_ + 4;
         int cr_app = is_header_ ? 4 : pay_cr_;
-        double deinter[LORA_LITE_MAX_SF][8];
+        float deinter[LORA_LITE_MAX_SF][8];
         for (int i = 0; i < cw_len; i++)
             for (int j = 0; j < sf_app; j++)
                 deinter[lmod(i - j - 1, sf_app)][i] = llr_block_[i][sf_ - sf_app + j];
@@ -526,9 +517,26 @@ private:
             // drop 5 header nibbles
             for (int i = 5; i < nib_n_; i++) nibbles_[i - 5] = nibbles_[i];
             nib_n_ -= 5;
+            // A valid header checksum + matching sync is a high-confidence real
+            // packet. Emit a detection now so the caller sees it even if the
+            // payload never fully assembles (weak signal fades before the end).
+            emit_detection();
         }
         uint32_t need = pay_len_ * 2 + (pay_crc_ ? 4 : 0);
         if (!is_header_ && (uint32_t)nib_n_ >= need) emit();
+    }
+
+    void emit_detection() {
+        Packet pkt{};
+        pkt.len = 0;
+        pkt.hdr_len = (uint8_t)pay_len_;
+        pkt.status = PKT_HEADER_ONLY;
+        pkt.has_crc = pay_crc_;
+        pkt.crc_ok = false;
+        pkt.snr = cur_snr_;
+        pkt.cfo = m_cfo_int_ + m_cfo_frac_;
+        pkt.sync = det_sync_;
+        if (cb_) cb_(pkt, user_);
     }
 
     void emit() {
@@ -550,6 +558,8 @@ private:
             uint16_t rx = bytes[pay_len_] | ((uint16_t)bytes[pay_len_ + 1] << 8);
             pkt.crc_ok = (calc == rx);
         }
+        pkt.hdr_len = (uint8_t)pay_len_;
+        pkt.status = pkt.crc_ok ? PKT_DECODED : PKT_CRC_FAIL;
         if (cb_) cb_(pkt, user_);
         nib_n_ = 0;
         reset();

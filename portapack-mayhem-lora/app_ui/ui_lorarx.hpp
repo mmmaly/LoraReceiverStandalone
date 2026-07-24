@@ -46,6 +46,7 @@ class LoRaRxView : public View {
     app_settings::SettingsManager settings_{"rx_lora", app_settings::Mode::RX};
 
     uint32_t packet_count{0};
+    uint32_t decoded_count{0};
 
     RFAmpField field_rf_amp{{13 * 8, 0 * 16}};
     LNAGainField field_lna{{15 * 8, 0 * 16}};
