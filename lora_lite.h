@@ -211,6 +211,18 @@ private:
     uint8_t nibbles_rot_[NIB_CAP];
     uint8_t nib_alt_[NIB_CAP];
     float nib_margin_[NIB_CAP];
+    // Decode scratch lives here, NOT on the stack: the M4 baseband process
+    // stack is 4 KiB and the decode_block->emit->nibble_chase chain sits at
+    // its deepest point. Stack-allocating these overflowed into the IRQ
+    // stack and hard-faulted the M4 mid-decode (surfacing as "Baseband Sync
+    // Fail" on the next M0 message). The Demod object is static, so member
+    // storage costs bss (plentiful), not stack.
+    float deinter_[LORA_LITE_MAX_SF][8];
+    float deinter_rot_[LORA_LITE_MAX_SF][8];
+    uint8_t chase_trial_[NIB_CAP];
+    uint8_t chase_found_[LORA_LITE_MAX_PAYLOAD + 2];
+    uint8_t chase_bytes_[LORA_LITE_MAX_PAYLOAD + 2];
+    uint8_t rot_bytes_[LORA_LITE_MAX_PAYLOAD + 2];
 
     void reset() {
         state_ = DETECT; symbol_cnt_ = 1; bin_idx_ = 0; k_hat_ = 0;
@@ -515,21 +527,19 @@ private:
         int sf_app = (is_header_ || ldro_) ? sf_ - 2 : sf_;
         int cw_len = is_header_ ? 8 : pay_cr_ + 4;
         int cr_app = is_header_ ? 4 : pay_cr_;
-        float deinter[LORA_LITE_MAX_SF][8];
         for (int i = 0; i < cw_len; i++)
             for (int j = 0; j < sf_app; j++)
-                deinter[lmod(i - j - 1, sf_app)][i] = llr_block_[i][sf_ - sf_app + j];
-        float deinter_rot[LORA_LITE_MAX_SF][8];
+                deinter_[lmod(i - j - 1, sf_app)][i] = llr_block_[i][sf_ - sf_app + j];
         if (nid_resid_)
             for (int i = 0; i < cw_len; i++)
                 for (int j = 0; j < sf_app; j++)
-                    deinter_rot[lmod(i - j - 1, sf_app)][i] = llr_block_rot_[i][sf_ - sf_app + j];
+                    deinter_rot_[lmod(i - j - 1, sf_app)][i] = llr_block_rot_[i][sf_ - sf_app + j];
         for (int i = 0; i < sf_app; i++) {
             if (nib_n_ < NIB_CAP) {
-                nibbles_[nib_n_] = hamming_soft(deinter[i], cr_app,
+                nibbles_[nib_n_] = hamming_soft(deinter_[i], cr_app,
                                                 &nib_alt_[nib_n_], &nib_margin_[nib_n_]);
                 nibbles_rot_[nib_n_] = nid_resid_
-                    ? hamming_soft(deinter_rot[i], cr_app) : nibbles_[nib_n_];
+                    ? hamming_soft(deinter_rot_[i], cr_app) : nibbles_[nib_n_];
                 nib_n_++;
             }
         }
@@ -625,11 +635,11 @@ private:
                 }
             }
         }
-        uint8_t trial[NIB_CAP];
+        uint8_t* trial = chase_trial_;
         memcpy(trial, nibbles_, n_nib);
-        uint8_t found[LORA_LITE_MAX_PAYLOAD + 2];
+        uint8_t* found = chase_found_;
         int n_passed = 0;
-        uint8_t tb[LORA_LITE_MAX_PAYLOAD + 2];
+        uint8_t* tb = chase_bytes_;
         auto test = [&]() {
             build_bytes(trial, tb, total);
             if (crc_ok(tb)) {
@@ -672,10 +682,9 @@ private:
             if (!pkt.crc_ok && nid_resid_) {
                 // rotation hypothesis: shadow stream decoded under the
                 // net-ID-residual bin shift
-                uint8_t rot_bytes[LORA_LITE_MAX_PAYLOAD + 2];
-                build_bytes(nibbles_rot_, rot_bytes, total);
-                if (crc_ok(rot_bytes)) {
-                    memcpy(bytes, rot_bytes, total);
+                build_bytes(nibbles_rot_, rot_bytes_, total);
+                if (crc_ok(rot_bytes_)) {
+                    memcpy(bytes, rot_bytes_, total);
                     pkt.crc_ok = true;
                 }
             }
