@@ -70,6 +70,22 @@ make firmware -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
    LoRa. If you build on a tagged stable release instead of bleeding master, they
    should fit and you can re-enable them.
 
+### Gotchas found later (2026-07-25)
+
+5. **Stale .ppma on incremental rebuilds**: `make firmware` does NOT repackage
+   `lorarx.ppma` when only the baseband (`lora_lite.h`/`proc_lorarx.cpp`)
+   changed - the ppma keeps the previous M4 image silently. Force it:
+   `rm build/firmware/application/lorarx.ppma && touch firmware/application/external/lorarx/main.cpp`
+   before `make firmware`. Verify by checking the embedded image against
+   `build/firmware/baseband/PLOR.bin` (m4_app_offset is at ppma byte 80).
+6. **The M4 process stack is 4 KiB** (`__process_stack_size__`). Decode-path
+   code in lora_lite must NOT stack-allocate large scratch buffers - the
+   deepest chain (decode_block -> emit -> nibble_chase) overflowed into the
+   IRQ stack and hard-faulted the M4 mid-decode, which surfaces as a
+   "Baseband Sync Fail" panic on the next M0 message (the app starts fine,
+   then red-screens once traffic arrives). Scratch belongs in Demod members
+   (bss has ~20 KiB headroom; the stack has none).
+
 ## LoRa-specific size work
 
 The M4 baseband image must fit a 32 KB slot **combined with the M0 UI** (the .ppma
