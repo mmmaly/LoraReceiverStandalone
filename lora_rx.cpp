@@ -217,6 +217,11 @@ public:
     };
 
     std::vector<Packet> last_packets;
+    // CFO (in bins) of every frame that reached sync. Written only by this
+    // demod's own worker thread; read after the thread is joined. Sweep mode
+    // uses it to recover a transmitter's TRUE centre frequency when the scan
+    // grid lands off-channel.
+    std::vector<float> sync_cfos;
 
     LoRaDemodulator(const LoRaConfig &cfg_, std::string tag_ = "", std::string stdout_tag_ = "")
         : cfg(cfg_), tag(std::move(tag_)), stdout_tag(std::move(stdout_tag_)) {
@@ -457,6 +462,7 @@ public:
                         // constant bin offset the payload will suffer.
                         long dpos = mod(nid[0] - cfg.sync_words[0], N);
                         long nid_resid = dpos <= (long)N / 2 ? dpos : dpos - (long)N;
+                        sync_cfos.push_back(m_cfo_int + m_cfo_frac);
                         std::lock_guard<std::mutex> lk(g_print_mtx);
                         fprintf(stderr, "%s[sync] Frame #%u detected, CFO=%.2f, sync=0x%02X, SNR=%.1f dB, nid_resid=%+ld\n",
                                 tag.c_str(), frame_cnt, m_cfo_int + m_cfo_frac, det_sync, snr_e, nid_resid);
@@ -1595,6 +1601,20 @@ public:
     }
 
     size_t packet_count() const { return demod.last_packets.size(); }
+    size_t crc_ok_count() const {
+        size_t n = 0;
+        for (const auto &p : demod.last_packets) if (p.crc_valid) n++;
+        return n;
+    }
+    // Median sync CFO in bins (0 if never synced); median resists the odd
+    // false sync latching onto noise.
+    float median_sync_cfo() const {
+        if (demod.sync_cfos.empty()) return 0;
+        std::vector<float> v = demod.sync_cfos;
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    }
+    size_t sync_count() const { return demod.sync_cfos.size(); }
     const std::string &tag() const { return tag_; }
 
 private:
@@ -1777,18 +1797,106 @@ static std::vector<long> parse_list(const char *s) {
 // Sweep mode (-W lo,hi[,dwell]): hardware retuning + full software demod
 // ============================================================================
 //
-// The band is covered in chunks of the central ~75% of the sample rate
-// (tuner edges are filter-rolloff territory), overlapping by one channel BW.
-// Candidate channels sit on a raster = the smallest BW being scanned, and the
-// tuner is parked on a raster point PLUS raster/2, so no candidate channel
-// can ever sit on the DC spike. Each chunk gets the full worker fan-out
-// (channels x SFs x BWs) for `dwell` seconds, then the sweep advances;
-// LoRa traffic is sporadic, so long dwells + endless cycling (survey style)
-// beat fast sweeping. Per-chunk hit summaries go to stderr; decoded packets
-// use the normal stdout format (rx cfg/rx msg/rx ok), so the whole pipeline
-// (tee, meshcore-decoder stream) works unchanged.
+// The band is covered in chunks of the central ~75% of the sample rate (tuner
+// edges are filter-rolloff territory), overlapping by one channel BW, and the
+// tuner parks off the channel raster so no candidate can sit on the DC spike.
+//
+// Two stages per chunk, because real deployments do NOT sit on a nice raster
+// (MeshCore SK is 869.618 MHz - 7 kHz off every 62.5 kHz grid point, i.e. ~29
+// bins at SF8): a COARSE pass on the raster detects frames (frame sync
+// tolerates a large offset even when the payload cannot be decoded through
+// it), and each detection's CFO reveals the transmitter's true centre. A
+// REFINE pass then re-runs the demodulators at those exact frequencies, where
+// decoding actually works. Refine costs nothing where nothing was detected.
+struct SweepSpec {
+    uint32_t freq;
+    uint8_t sf;
+    uint32_t bw;
+};
+
+struct SweepStat {
+    std::string tag;
+    uint32_t freq;
+    uint8_t sf;
+    uint32_t bw;
+    size_t syncs;
+    size_t ok;
+    float med_cfo_bins;
+    double implied_hz;   // freq + CFO, i.e. where the transmitter really is
+};
+
+// Build the worker fan-out for `specs`, stream `dwell_s` seconds through it,
+// then tear it down and return per-worker statistics.
+static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &cfg,
+                                          uint32_t tuner, const std::vector<SweepSpec> &specs,
+                                          int dwell_s, std::vector<unsigned char> &buf,
+                                          bool settle) {
+    std::vector<SweepStat> stats;
+    if (specs.empty()) return stats;
+
+    // group specs by channel frequency so each channel is shifted once
+    std::vector<uint32_t> freqs;
+    for (const auto &sp : specs)
+        if (std::find(freqs.begin(), freqs.end(), sp.freq) == freqs.end()) freqs.push_back(sp.freq);
+
+    for (uint32_t chf : freqs) {
+        g_channels.push_back({});
+        ChannelFanout &ch = g_channels.back();
+        ch.freq = chf;
+        double off = (double)chf - (double)tuner;
+        ch.identity = (off == 0.0);
+        ch.phase_inc = -2.0 * M_PI * off / (double)cfg.samp_rate;
+        for (const auto &sp : specs) {
+            if (sp.freq != chf) continue;
+            LoRaConfig c = cfg;
+            c.freq = sp.freq; c.sf = sp.sf; c.bw = sp.bw;
+            c.compute_derived();
+            char sbuf[64];
+            snprintf(sbuf, sizeof(sbuf), "freq=%u sf=%u bw=%u", sp.freq, sp.sf, sp.bw);
+            g_workers.emplace_back(new DemodWorker(c, make_tag(sp.freq, sp.sf, sp.bw), sbuf));
+            ch.workers.push_back(g_workers.back().get());
+        }
+    }
+
+    if (settle) {
+        rtlsdr_reset_buffer(dev);
+        for (uint32_t discarded = 0; discarded < cfg.samp_rate / 5 && g_running;) {
+            int n_read = 0;
+            if (rtlsdr_read_sync(dev, buf.data(), (int)buf.size(), &n_read) < 0 || n_read <= 0) break;
+            discarded += (uint32_t)n_read;
+        }
+    }
+    auto t_end = std::chrono::steady_clock::now() + std::chrono::seconds(dwell_s);
+    while (g_running && std::chrono::steady_clock::now() < t_end) {
+        int n_read = 0;
+        if (rtlsdr_read_sync(dev, buf.data(), (int)buf.size(), &n_read) < 0) {
+            fprintf(stderr, "[sweep] read error, stopping\n");
+            g_running = false;
+            break;
+        }
+        if (n_read > 0) broadcast_u8(buf.data(), (uint32_t)n_read);
+    }
+
+    finish_workers();
+    size_t wi = 0;
+    for (uint32_t chf : freqs) {
+        for (const auto &sp : specs) {
+            if (sp.freq != chf) continue;
+            DemodWorker *w = g_workers[wi++].get();
+            if (w->sync_count() == 0 && w->packet_count() == 0) continue;
+            float cfo = w->median_sync_cfo();
+            double bin_hz = (double)sp.bw / (double)(1u << sp.sf);
+            stats.push_back({w->tag(), sp.freq, sp.sf, sp.bw, w->sync_count(), w->crc_ok_count(),
+                             cfo, (double)sp.freq + cfo * bin_hz});
+        }
+    }
+    g_workers.clear();
+    g_channels.clear();
+    return stats;
+}
+
 static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
-                     const std::vector<uint8_t>& sfs, const std::vector<uint32_t>& bws) {
+                     const std::vector<uint8_t> &sfs, const std::vector<uint32_t> &bws) {
     const uint32_t raster = *std::min_element(bws.begin(), bws.end());
     const uint32_t maxbw = *std::max_element(bws.begin(), bws.end());
     const double usable = 0.75 * cfg.samp_rate;
@@ -1828,70 +1936,52 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
         double want = f_lo + usable / 2 + chunk * step;
         if (want + usable / 2 > f_hi) want = f_hi - usable / 2;
         if (want - usable / 2 < f_lo) want = f_lo + usable / 2;
-        // park the tuner off the raster grid: no channel can land on DC
         uint32_t tuner = (uint32_t)(llround((want - raster / 2.0) / raster) * raster + raster / 2);
 
-        std::vector<uint32_t> chans;
+        std::vector<SweepSpec> coarse;
         for (int64_t c = (int64_t)ceil((tuner - usable / 2) / (double)raster) * raster;
              c <= (int64_t)(tuner + usable / 2); c += raster) {
             if (c - maxbw / 2.0 < tuner - usable / 2 || c + maxbw / 2.0 > tuner + usable / 2) continue;
             if (c < f_lo - raster / 2.0 || c > f_hi + raster / 2.0) continue;
-            chans.push_back((uint32_t)c);
+            for (uint32_t bw : bws)
+                for (uint8_t sf : sfs)
+                    coarse.push_back({(uint32_t)c, sf, bw});
         }
-        size_t n_workers = chans.size() * sfs.size() * bws.size();
-        fprintf(stderr, "[sweep] chunk %d/%d: tuner %.4f MHz, %zu channel(s) x %zu SF x %zu BW = %zu decoders\n",
-                chunk + 1, n_chunks, tuner / 1e6, chans.size(), sfs.size(), bws.size(), n_workers);
-
-        for (uint32_t chf : chans) {
-            g_channels.push_back({});
-            ChannelFanout &ch = g_channels.back();
-            ch.freq = chf;
-            double off = (double)chf - (double)tuner;
-            ch.identity = (off == 0.0);
-            ch.phase_inc = -2.0 * M_PI * off / (double)cfg.samp_rate;
-            for (uint32_t bw : bws) {
-                for (uint8_t sf : sfs) {
-                    LoRaConfig c = cfg;
-                    c.freq = chf; c.sf = sf; c.bw = bw;
-                    c.compute_derived();
-                    char sbuf[64];
-                    snprintf(sbuf, sizeof(sbuf), "freq=%u sf=%u bw=%u", chf, sf, bw);
-                    g_workers.emplace_back(new DemodWorker(c, make_tag(chf, sf, bw), sbuf));
-                    ch.workers.push_back(g_workers.back().get());
-                }
-            }
-        }
+        fprintf(stderr, "[sweep] chunk %d/%d: tuner %.4f MHz, %zu decoder(s) on the %u Hz grid\n",
+                chunk + 1, n_chunks, tuner / 1e6, coarse.size(), raster);
 
         rtlsdr_set_center_freq(dev, tuner);
-        rtlsdr_reset_buffer(dev);
-        // discard ~100 ms of PLL/AGC settling
-        for (uint32_t discarded = 0; discarded < cfg.samp_rate / 5 && g_running;) {
-            int n_read = 0;
-            if (rtlsdr_read_sync(dev, buf.data(), (int)buf.size(), &n_read) < 0 || n_read <= 0) break;
-            discarded += n_read;
-        }
-        auto t_end = std::chrono::steady_clock::now() + std::chrono::seconds(dwell_s);
-        while (g_running && std::chrono::steady_clock::now() < t_end) {
-            int n_read = 0;
-            if (rtlsdr_read_sync(dev, buf.data(), (int)buf.size(), &n_read) < 0) {
-                fprintf(stderr, "[sweep] read error, stopping\n");
-                g_running = false;
-                break;
-            }
-            if (n_read > 0) broadcast_u8(buf.data(), (uint32_t)n_read);
-        }
+        auto stats = sweep_dwell(dev, cfg, tuner, coarse, dwell_s, buf, true);
+        if (!g_running) break;
 
-        finish_workers();
-        size_t hits = 0;
-        for (auto &w : g_workers) {
-            if (w->packet_count() > 0) {
-                fprintf(stderr, "[sweep]   HIT %s%zu packet(s)\n", w->tag().c_str(), w->packet_count());
-                hits += w->packet_count();
-            }
+        // Report the coarse pass and collect refine candidates: any detection
+        // whose CFO puts the real carrier more than a quarter bin away.
+        std::vector<SweepSpec> refine;
+        for (const auto &st : stats) {
+            if (st.ok)
+                fprintf(stderr, "[sweep]   HIT %s%zu packet(s) CRC-ok, %zu sync(s), CFO %+.1f bins\n",
+                        st.tag.c_str(), st.ok, st.syncs, st.med_cfo_bins);
+            else
+                fprintf(stderr, "[sweep]   DETECT %s%zu sync(s), CFO %+.1f bins -> carrier ~%.4f MHz\n",
+                        st.tag.c_str(), st.syncs, st.med_cfo_bins, st.implied_hz / 1e6);
+            if (st.syncs == 0 || fabs(st.med_cfo_bins) < 0.25) continue;
+            uint32_t rf = (uint32_t)llround(st.implied_hz / 500.0) * 500;  // 500 Hz resolution
+            if (rf < f_lo - maxbw || rf > f_hi + maxbw) continue;
+            if (fabs((double)rf - tuner) + maxbw / 2.0 > usable / 2.0) continue;  // stays in-chunk
+            bool dup = false;
+            for (const auto &r : refine)
+                if (r.sf == st.sf && r.bw == st.bw && labs((long)r.freq - (long)rf) < 500) dup = true;
+            if (!dup && refine.size() < 24) refine.push_back({rf, st.sf, st.bw});
         }
-        if (!hits) fprintf(stderr, "[sweep]   no packets in this chunk\n");
-        g_workers.clear();
-        g_channels.clear();
+        if (stats.empty()) fprintf(stderr, "[sweep]   nothing detected in this chunk\n");
+
+        if (!refine.empty() && g_running) {
+            fprintf(stderr, "[sweep]   refining %zu off-grid carrier(s) for %d s\n", refine.size(), dwell_s);
+            auto rstats = sweep_dwell(dev, cfg, tuner, refine, dwell_s, buf, false);
+            for (const auto &st : rstats)
+                fprintf(stderr, "[sweep]   %s %s%zu packet(s) CRC-ok, %zu sync(s), residual CFO %+.1f bins\n",
+                        st.ok ? "REFINED HIT" : "refined", st.tag.c_str(), st.ok, st.syncs, st.med_cfo_bins);
+        }
     }
     rtlsdr_close(dev);
     return 0;
