@@ -79,12 +79,17 @@ make firmware -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
    before `make firmware`. Verify by checking the embedded image against
    `build/firmware/baseband/PLOR.bin` (m4_app_offset is at ppma byte 80).
 6. **The M4 process stack is 4 KiB** (`__process_stack_size__`). Decode-path
-   code in lora_lite must NOT stack-allocate large scratch buffers - the
-   deepest chain (decode_block -> emit -> nibble_chase) overflowed into the
-   IRQ stack and hard-faulted the M4 mid-decode, which surfaces as a
-   "Baseband Sync Fail" panic on the next M0 message (the app starts fine,
-   then red-screens once traffic arrives). Scratch belongs in Demod members
-   (bss has ~20 KiB headroom; the stack has none).
+   code in lora_lite must NOT stack-allocate large scratch buffers; keep
+   scratch in Demod members.
+7. **Usable M4 local SRAM ends at ~80 KiB, not the 96 KiB the linker claims.**
+   Ladder-bisected on hardware: adding ~2 KiB of unused bss to the working
+   image made the M4 die before signaling ready ("Baseband Sync Fail" at app
+   open, ~3 s in), with heap allocations crossing ~0x10014000. The linker,
+   the map, and the LPC4320 datasheet all say the region is fine - the
+   hardware disagrees. Keep the baseband image's total RAM (bss + data +
+   stacks + peak heap) at or below the proven-working figure (bss 74,664 for
+   this app); lora_lite overlays its recovery buffers onto the dead preamble
+   capture in a union to stay exactly there.
 
 ## LoRa-specific size work
 
