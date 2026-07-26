@@ -64,6 +64,7 @@ make check      # builds the offline frame generator and runs end-to-end tests (
 | `-I` | Implicit header mode | off |
 | `-L <bytes>` | Payload length (implicit mode) | 11 |
 | `-A` | Auto-scan: run all SF (7-12) x BW decoders in parallel | off |
+| `-W <lo>,<hi>[,<dwell>]` | Survey sweep: retune through the band in overlapping chunks (central 75% of the sample rate), running the full channel x SF x BW demod fan-out on each for `dwell` seconds (default 30), cycling forever. Channels sit on a raster of the smallest BW; the tuner parks off-grid so no channel lands on the DC spike. Defaults: BW 125k, SF 7-12, 2 MS/s (auto-lowered so every BW ratio stays <= 16). Per-chunk `HIT` summaries on stderr; normal `rx cfg`/`rx ok` stdout. | — |
 | `-r <file>` | Replay IQ from file (rtl_sdr u8 format, `-` = stdin) instead of SDR; a `.C16` file is read as PortaPack/Mayhem int16 IQ, with tuner freq and sample rate defaulted from its `.TXT` sidecar | — |
 | `-D <file>` | Dump raw IQ to file while receiving (replay later with `-r`) | — |
 
