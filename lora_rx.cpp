@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <string>
+#include <chrono>
 #include <strings.h>
 #include <sys/time.h>
 #include <getopt.h>
@@ -1772,15 +1773,135 @@ static std::vector<long> parse_list(const char *s) {
     return out;
 }
 
+// ============================================================================
+// Sweep mode (-W lo,hi[,dwell]): hardware retuning + full software demod
+// ============================================================================
+//
+// The band is covered in chunks of the central ~75% of the sample rate
+// (tuner edges are filter-rolloff territory), overlapping by one channel BW.
+// Candidate channels sit on a raster = the smallest BW being scanned, and the
+// tuner is parked on a raster point PLUS raster/2, so no candidate channel
+// can ever sit on the DC spike. Each chunk gets the full worker fan-out
+// (channels x SFs x BWs) for `dwell` seconds, then the sweep advances;
+// LoRa traffic is sporadic, so long dwells + endless cycling (survey style)
+// beat fast sweeping. Per-chunk hit summaries go to stderr; decoded packets
+// use the normal stdout format (rx cfg/rx msg/rx ok), so the whole pipeline
+// (tee, meshcore-decoder stream) works unchanged.
+static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
+                     const std::vector<uint8_t>& sfs, const std::vector<uint32_t>& bws) {
+    const uint32_t raster = *std::min_element(bws.begin(), bws.end());
+    const uint32_t maxbw = *std::max_element(bws.begin(), bws.end());
+    const double usable = 0.75 * cfg.samp_rate;
+    const double span = f_hi - f_lo;
+    double step = usable - 2.0 * maxbw;
+    int n_chunks = span <= usable ? 1 : (int)ceil((span - usable) / step) + 1;
+
+    fprintf(stderr, "[sweep] %.4f-%.4f MHz, %d chunk(s) of %.0f kHz usable, dwell %d s, raster %u Hz\n",
+            f_lo / 1e6, f_hi / 1e6, n_chunks, usable / 1e3, dwell_s, raster);
+
+    rtlsdr_dev_t *dev = nullptr;
+    if (rtlsdr_get_device_count() == 0) {
+        fprintf(stderr, "No RTL-SDR devices found\n");
+        return 1;
+    }
+    if (rtlsdr_open(&dev, 0) < 0) {
+        fprintf(stderr, "Failed to open RTL-SDR device\n");
+        return 1;
+    }
+    g_dev = dev;
+    rtlsdr_set_sample_rate(dev, cfg.samp_rate);
+    rtlsdr_set_freq_correction(dev, cfg.ppm);
+    if (cfg.tuner_agc) {
+        rtlsdr_set_tuner_gain_mode(dev, 0);
+    } else {
+        rtlsdr_set_tuner_gain_mode(dev, 1);
+        rtlsdr_set_tuner_gain(dev, cfg.gain);
+    }
+    rtlsdr_set_agc_mode(dev, cfg.rtl_agc ? 1 : 0);
+
+    std::vector<unsigned char> buf(16384 * 16);
+    for (int chunk = 0; g_running; chunk = (chunk + 1) % n_chunks) {
+        double want = f_lo + usable / 2 + chunk * step;
+        if (want + usable / 2 > f_hi) want = f_hi - usable / 2;
+        if (want - usable / 2 < f_lo) want = f_lo + usable / 2;
+        // park the tuner off the raster grid: no channel can land on DC
+        uint32_t tuner = (uint32_t)(llround((want - raster / 2.0) / raster) * raster + raster / 2);
+
+        std::vector<uint32_t> chans;
+        for (int64_t c = (int64_t)ceil((tuner - usable / 2) / (double)raster) * raster;
+             c <= (int64_t)(tuner + usable / 2); c += raster) {
+            if (c - maxbw / 2.0 < tuner - usable / 2 || c + maxbw / 2.0 > tuner + usable / 2) continue;
+            if (c < f_lo - raster / 2.0 || c > f_hi + raster / 2.0) continue;
+            chans.push_back((uint32_t)c);
+        }
+        size_t n_workers = chans.size() * sfs.size() * bws.size();
+        fprintf(stderr, "[sweep] chunk %d/%d: tuner %.4f MHz, %zu channel(s) x %zu SF x %zu BW = %zu decoders\n",
+                chunk + 1, n_chunks, tuner / 1e6, chans.size(), sfs.size(), bws.size(), n_workers);
+
+        for (uint32_t chf : chans) {
+            g_channels.push_back({});
+            ChannelFanout &ch = g_channels.back();
+            ch.freq = chf;
+            double off = (double)chf - (double)tuner;
+            ch.identity = (off == 0.0);
+            ch.phase_inc = -2.0 * M_PI * off / (double)cfg.samp_rate;
+            for (uint32_t bw : bws) {
+                for (uint8_t sf : sfs) {
+                    LoRaConfig c = cfg;
+                    c.freq = chf; c.sf = sf; c.bw = bw;
+                    c.compute_derived();
+                    char sbuf[64];
+                    snprintf(sbuf, sizeof(sbuf), "freq=%u sf=%u bw=%u", chf, sf, bw);
+                    g_workers.emplace_back(new DemodWorker(c, make_tag(chf, sf, bw), sbuf));
+                    ch.workers.push_back(g_workers.back().get());
+                }
+            }
+        }
+
+        rtlsdr_set_center_freq(dev, tuner);
+        rtlsdr_reset_buffer(dev);
+        // discard ~100 ms of PLL/AGC settling
+        for (uint32_t discarded = 0; discarded < cfg.samp_rate / 5 && g_running;) {
+            int n_read = 0;
+            if (rtlsdr_read_sync(dev, buf.data(), (int)buf.size(), &n_read) < 0 || n_read <= 0) break;
+            discarded += n_read;
+        }
+        auto t_end = std::chrono::steady_clock::now() + std::chrono::seconds(dwell_s);
+        while (g_running && std::chrono::steady_clock::now() < t_end) {
+            int n_read = 0;
+            if (rtlsdr_read_sync(dev, buf.data(), (int)buf.size(), &n_read) < 0) {
+                fprintf(stderr, "[sweep] read error, stopping\n");
+                g_running = false;
+                break;
+            }
+            if (n_read > 0) broadcast_u8(buf.data(), (uint32_t)n_read);
+        }
+
+        finish_workers();
+        size_t hits = 0;
+        for (auto &w : g_workers) {
+            if (w->packet_count() > 0) {
+                fprintf(stderr, "[sweep]   HIT %s%zu packet(s)\n", w->tag().c_str(), w->packet_count());
+                hits += w->packet_count();
+            }
+        }
+        if (!hits) fprintf(stderr, "[sweep]   no packets in this chunk\n");
+        g_workers.clear();
+        g_channels.clear();
+    }
+    rtlsdr_close(dev);
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
     LoRaConfig cfg;
     const char *iq_file = nullptr;
     const char *dump_file = nullptr;
     bool auto_mode = false, freq_given = false, samp_given = false;
-    std::vector<long> sfs_cli, bws_cli, chans_cli;
+    std::vector<long> sfs_cli, bws_cli, chans_cli, sweep_cli;
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:W:")) != -1) {
         switch (opt) {
         case 'f': cfg.freq = (uint32_t)atol(optarg); freq_given = true; break;
         case 's': cfg.samp_rate = (uint32_t)atol(optarg); samp_given = true; break;
@@ -1798,12 +1919,16 @@ int main(int argc, char *argv[]) {
         case 'D': dump_file = optarg; break;
         case 'A': auto_mode = true; break;
         case 'C': chans_cli = parse_list(optarg); break;
+        case 'W': sweep_cli = parse_list(optarg); break;
         default:
             fprintf(stderr, "Usage: %s [-f tuner_freq] [-s samp_rate] [-b bw[,bw..]] [-S sf[,sf..]] [-c cr]\n"
                             "          [-w sync_word_hex] [-g gain] [-G] [-p ppm] [-I] [-L pay_len] [-A]\n"
                             "          [-C chan_freq[,chan_freq..]] [-r iq_file] [-D dump_file]\n"
                             "  -G enables the RTL2832 internal digital AGC\n"
                             "  -T enables the R820T analog tuner AGC (overrides -g)\n"
+                            "  -W f_lo,f_hi[,dwell_s] sweeps the band in retuned chunks, running the full\n"
+                            "     channel x SF x BW demod fan-out on each (survey scan; default\n"
+                            "     dwell 30 s, BW 125k, SF 7-12; override with -b/-S/-s/-g/...)\n"
                             "  -r accepts rtl_sdr u8 IQ; a .C16 file is read as PortaPack int16 IQ,\n"
                             "     with tuner freq / sample rate defaulted from its Mayhem .TXT sidecar\n", argv[0]);
             return 1;
@@ -1828,6 +1953,52 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Warning: CR %u out of range 1-4, using %u (explicit header overrides it anyway)\n",
                 cfg.cr, clamped);
         cfg.cr = clamped;
+    }
+
+    // Sweep mode: hardware retuning + software fan-out, then exit
+    if (!sweep_cli.empty()) {
+        if (sweep_cli.size() < 2) {
+            fprintf(stderr, "-W needs f_lo,f_hi[,dwell_seconds]\n");
+            return 1;
+        }
+        if (iq_file) {
+            fprintf(stderr, "-W is a live-SDR mode and cannot be combined with -r\n");
+            return 1;
+        }
+        double f_lo = (double)sweep_cli[0], f_hi = (double)sweep_cli[1];
+        int dwell = sweep_cli.size() > 2 ? (int)sweep_cli[2] : 30;
+        if (f_hi <= f_lo || dwell < 1) {
+            fprintf(stderr, "-W: need f_hi > f_lo and dwell >= 1\n");
+            return 1;
+        }
+        std::vector<uint8_t> ssfs;
+        for (long v : sfs_cli) ssfs.push_back((uint8_t)v);
+        if (ssfs.empty()) ssfs = {7, 8, 9, 10, 11, 12};
+        std::vector<uint32_t> sbws;
+        for (long v : bws_cli) sbws.push_back((uint32_t)v);
+        if (sbws.empty()) sbws = {125000};
+        if (!samp_given) {
+            // widest reliably-stable RTL rate that keeps every BW ratio <= 16
+            uint32_t min_bw = *std::min_element(sbws.begin(), sbws.end());
+            cfg.samp_rate = std::min<uint32_t>(2000000, 16 * min_bw);
+        }
+        for (uint32_t bw : sbws) {
+            if (cfg.samp_rate % bw != 0 || cfg.samp_rate / bw > 16) {
+                fprintf(stderr, "-W: samp_rate %u is not a usable multiple of bw %u (need integer ratio <= 16)\n",
+                        cfg.samp_rate, bw);
+                return 1;
+            }
+        }
+        for (int i = 0; i < 256; i++) g_u8lut[i] = ((float)i - 127.5f) / 127.5f;
+        signal(SIGINT, signal_handler);
+        signal(SIGTERM, signal_handler);
+        if (dump_file) {
+            g_dump = fopen(dump_file, "wb");
+            if (g_dump) fprintf(stderr, "Dumping raw IQ to %s\n", dump_file);
+        }
+        int rc = run_sweep(cfg, f_lo, f_hi, dwell, ssfs, sbws);
+        if (g_dump) fclose(g_dump);
+        return rc;
     }
 
     // Channel list: default is a single channel at the tuner frequency
