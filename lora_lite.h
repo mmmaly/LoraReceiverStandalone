@@ -174,14 +174,39 @@ private:
     PacketCb cb_; void* user_;
 
     // ---- tables/scratch ----
+    static constexpr int NIB_CAP = 2 * (LORA_LITE_MAX_PAYLOAD + 2) + 16;
     Cx upchirp_[MAX_N], downchirp_[MAX_N];
     Cx demod_down_[MAX_N];
     uint16_t demap_pay_[MAX_N], demap_hdr_[MAX_N];
     Cx dech_[2 * MAX_N], fout_[2 * MAX_N];
     float mag_[2 * MAX_N];
     Cx in_down_[MAX_N], symb_[MAX_N], cfo_corr_[MAX_N];
-    Cx pre_raw_[PRE_SYMS * MAX_N];
-    Cx pre_up_[CFO_SYMS * MAX_N];
+    // The 18 KiB preamble capture is only live from DETECT through
+    // finish_sync(); every recovery buffer below is only live while decoding
+    // the payload. They overlay in a union so the recovery feature set adds
+    // ZERO bss: the M4's usable local SRAM ends at ~80 KiB (measured on
+    // hardware - the linker's 96 KiB region is not all backed), and the
+    // pre-recovery Demod size already sat just under that line.
+    union Overlay {
+        struct {
+            Cx raw[PRE_SYMS * MAX_N];
+            Cx up[CFO_SYMS * MAX_N];
+        } pre;
+        struct {
+            float llr_block_rot[8][LORA_LITE_MAX_SF];
+            uint8_t nibbles_rot[NIB_CAP];
+            uint8_t nib_alt[NIB_CAP];
+            float nib_margin[NIB_CAP];
+            float deinter[LORA_LITE_MAX_SF][8];
+            float deinter_rot[LORA_LITE_MAX_SF][8];
+            uint8_t trial[NIB_CAP];
+            uint8_t found[LORA_LITE_MAX_PAYLOAD + 2];
+            uint8_t bytes[LORA_LITE_MAX_PAYLOAD + 2];
+            uint8_t rot_bytes[LORA_LITE_MAX_PAYLOAD + 2];
+        } pay;
+    } u_;
+    static_assert(sizeof(Overlay) == PRE_SYMS * MAX_N * sizeof(Cx) + CFO_SYMS * MAX_N * sizeof(Cx),
+                  "recovery buffers must fit inside the preamble capture");
     Fft fft_;
 
     // ---- frame-sync state (same fields as lora_rx) ----
@@ -194,13 +219,11 @@ private:
     static constexpr int N_UP_REQ = 5, UP_USE = 4, PREAMBLE_LEN = 8;
 
     // ---- payload decode state ----
-    static constexpr int NIB_CAP = 2 * (LORA_LITE_MAX_PAYLOAD + 2) + 16;
     int payload_sym_cnt_;
     uint32_t total_payload_symbols_;
     bool received_head_, ldro_, is_header_;
     int pay_cr_; uint32_t pay_len_; bool pay_crc_;
     float llr_block_[8][LORA_LITE_MAX_SF];
-    float llr_block_rot_[8][LORA_LITE_MAX_SF];
     int llr_block_n_;
     uint8_t nibbles_[NIB_CAP];
     int nib_n_;
@@ -208,21 +231,6 @@ private:
     // mapping rotated by the net-ID residual (integer CFO mis-split
     // hypothesis), plus per-nibble runner-up + margin for the nibble chase.
     int nid_resid_;
-    uint8_t nibbles_rot_[NIB_CAP];
-    uint8_t nib_alt_[NIB_CAP];
-    float nib_margin_[NIB_CAP];
-    // Decode scratch lives here, NOT on the stack: the M4 baseband process
-    // stack is 4 KiB and the decode_block->emit->nibble_chase chain sits at
-    // its deepest point. Stack-allocating these overflowed into the IRQ
-    // stack and hard-faulted the M4 mid-decode (surfacing as "Baseband Sync
-    // Fail" on the next M0 message). The Demod object is static, so member
-    // storage costs bss (plentiful), not stack.
-    float deinter_[LORA_LITE_MAX_SF][8];
-    float deinter_rot_[LORA_LITE_MAX_SF][8];
-    uint8_t chase_trial_[NIB_CAP];
-    uint8_t chase_found_[LORA_LITE_MAX_PAYLOAD + 2];
-    uint8_t chase_bytes_[LORA_LITE_MAX_PAYLOAD + 2];
-    uint8_t rot_bytes_[LORA_LITE_MAX_PAYLOAD + 2];
 
     void reset() {
         state_ = DETECT; symbol_cnt_ = 1; bin_idx_ = 0; k_hat_ = 0;
@@ -295,10 +303,10 @@ private:
         if (labs(lmod(labs((long)nb - (long)bin_idx_) + 1, N_) - 1) <= 1 && nb != (uint32_t)-1) {
             if (symbol_cnt_ == 1 && bin_idx_ != (uint32_t)-1) preamb_[0] = bin_idx_;
             preamb_[symbol_cnt_] = nb;
-            memcpy(&pre_raw_[N_ * symbol_cnt_], in_down_, N_ * sizeof(Cx));
+            memcpy(&u_.pre.raw[N_ * symbol_cnt_], in_down_, N_ * sizeof(Cx));
             symbol_cnt_++;
         } else {
-            memcpy(&pre_raw_[0], in_down_, N_ * sizeof(Cx));
+            memcpy(&u_.pre.raw[0], in_down_, N_ * sizeof(Cx));
             symbol_cnt_ = 1;
         }
         bin_idx_ = nb;
@@ -312,7 +320,7 @@ private:
 
     long do_sync() {
         if (!cfo_est_) {
-            estimate_cfo_frac(&pre_raw_[N_ - k_hat_]);
+            estimate_cfo_frac(&u_.pre.raw[N_ - k_hat_]);
             estimate_sto_frac();
             for (int n = 0; n < N_; n++) {
                 float a = -2.0f * PI_F * m_cfo_frac_ / N_ * n;
@@ -372,7 +380,7 @@ private:
         }
 
         // SNR from CFO-corrected preamble symbol
-        for (int i = 0; i < N_; i++) symb_[i] = cxmul(pre_raw_[i], cfo_corr_[i]);
+        for (int i = 0; i < N_; i++) symb_[i] = cxmul(u_.pre.raw[i], cfo_corr_[i]);
         for (int i = 0; i < N_; i++) dech_[i] = cxmul(symb_[i], downchirp_[i]);
         fftN(dech_, fout_, N_);
         float tot = 0, sig = 0;
@@ -417,7 +425,7 @@ private:
         m_cfo_frac_ = -atan2f(acc.i, acc.r) / (2.0f * PI_F);
         for (int n = 0; n < UP_USE * N_; n++) {
             float a = -2.0f * PI_F * m_cfo_frac_ / N_ * n;
-            pre_up_[n] = cxmul(s[n], (Cx){cosf(a), sinf(a)});
+            u_.pre.up[n] = cxmul(s[n], (Cx){cosf(a), sinf(a)});
         }
     }
 
@@ -425,7 +433,7 @@ private:
         int NN = 2 * N_;
         for (int j = 0; j < NN; j++) mag_[j] = 0;
         for (int i = 0; i < UP_USE; i++) {
-            for (int j = 0; j < N_; j++) dech_[j] = cxmul(pre_up_[N_ * i + j], downchirp_[j]);
+            for (int j = 0; j < N_; j++) dech_[j] = cxmul(u_.pre.up[N_ * i + j], downchirp_[j]);
             for (int j = N_; j < NN; j++) dech_[j] = (Cx){0, 0};
             fftN(dech_, fout_, NN);
             for (int j = 0; j < NN; j++) mag_[j] += cxnorm(fout_[j]);
@@ -466,7 +474,7 @@ private:
     void demod_symbol(const Cx* sym) {
         int block = 4 + (is_header_ ? 4 : pay_cr_);
         compute_llrs(sym, llr_block_[llr_block_n_],
-                     nid_resid_ ? llr_block_rot_[llr_block_n_] : nullptr);
+                     nid_resid_ ? u_.pay.llr_block_rot[llr_block_n_] : nullptr);
         llr_block_n_++;
         if (llr_block_n_ == block) { decode_block(); llr_block_n_ = 0; }
     }
@@ -529,17 +537,17 @@ private:
         int cr_app = is_header_ ? 4 : pay_cr_;
         for (int i = 0; i < cw_len; i++)
             for (int j = 0; j < sf_app; j++)
-                deinter_[lmod(i - j - 1, sf_app)][i] = llr_block_[i][sf_ - sf_app + j];
+                u_.pay.deinter[lmod(i - j - 1, sf_app)][i] = llr_block_[i][sf_ - sf_app + j];
         if (nid_resid_)
             for (int i = 0; i < cw_len; i++)
                 for (int j = 0; j < sf_app; j++)
-                    deinter_rot_[lmod(i - j - 1, sf_app)][i] = llr_block_rot_[i][sf_ - sf_app + j];
+                    u_.pay.deinter_rot[lmod(i - j - 1, sf_app)][i] = u_.pay.llr_block_rot[i][sf_ - sf_app + j];
         for (int i = 0; i < sf_app; i++) {
             if (nib_n_ < NIB_CAP) {
-                nibbles_[nib_n_] = hamming_soft(deinter_[i], cr_app,
-                                                &nib_alt_[nib_n_], &nib_margin_[nib_n_]);
-                nibbles_rot_[nib_n_] = nid_resid_
-                    ? hamming_soft(deinter_rot_[i], cr_app) : nibbles_[nib_n_];
+                nibbles_[nib_n_] = hamming_soft(u_.pay.deinter[i], cr_app,
+                                                &u_.pay.nib_alt[nib_n_], &u_.pay.nib_margin[nib_n_]);
+                u_.pay.nibbles_rot[nib_n_] = nid_resid_
+                    ? hamming_soft(u_.pay.deinter_rot[i], cr_app) : nibbles_[nib_n_];
                 nib_n_++;
             }
         }
@@ -570,9 +578,9 @@ private:
             // drop 5 header nibbles (all parallel streams stay aligned)
             for (int i = 5; i < nib_n_; i++) {
                 nibbles_[i - 5] = nibbles_[i];
-                nibbles_rot_[i - 5] = nibbles_rot_[i];
-                nib_alt_[i - 5] = nib_alt_[i];
-                nib_margin_[i - 5] = nib_margin_[i];
+                u_.pay.nibbles_rot[i - 5] = u_.pay.nibbles_rot[i];
+                u_.pay.nib_alt[i - 5] = u_.pay.nib_alt[i];
+                u_.pay.nib_margin[i - 5] = u_.pay.nib_margin[i];
             }
             nib_n_ -= 5;
             // A valid header checksum + matching sync is a high-confidence real
@@ -628,18 +636,18 @@ private:
         for (int i = 0; i < k; i++) pos[i] = -1;
         for (int p = 0; p < n_nib; p++) {          // partial selection sort: k smallest margins
             for (int i = 0; i < k; i++) {
-                if (pos[i] < 0 || nib_margin_[p] < nib_margin_[pos[i]]) {
+                if (pos[i] < 0 || u_.pay.nib_margin[p] < u_.pay.nib_margin[pos[i]]) {
                     for (int j = k - 1; j > i; j--) pos[j] = pos[j - 1];
                     pos[i] = p;
                     break;
                 }
             }
         }
-        uint8_t* trial = chase_trial_;
+        uint8_t* trial = u_.pay.trial;
         memcpy(trial, nibbles_, n_nib);
-        uint8_t* found = chase_found_;
+        uint8_t* found = u_.pay.found;
         int n_passed = 0;
-        uint8_t* tb = chase_bytes_;
+        uint8_t* tb = u_.pay.bytes;
         auto test = [&]() {
             build_bytes(trial, tb, total);
             if (crc_ok(tb)) {
@@ -648,14 +656,14 @@ private:
             }
         };
         for (int i = 0; i < k && n_passed < 2; i++) {
-            trial[pos[i]] = nib_alt_[pos[i]];
+            trial[pos[i]] = u_.pay.nib_alt[pos[i]];
             test();
             for (int j = i + 1; j < k && n_passed < 2; j++) {
-                trial[pos[j]] = nib_alt_[pos[j]];
+                trial[pos[j]] = u_.pay.nib_alt[pos[j]];
                 test();
                 if (i < k3 && j < k3) {
                     for (int c = j + 1; c < k3 && n_passed < 2; c++) {
-                        trial[pos[c]] = nib_alt_[pos[c]];
+                        trial[pos[c]] = u_.pay.nib_alt[pos[c]];
                         test();
                         trial[pos[c]] = nibbles_[pos[c]];
                     }
@@ -682,9 +690,9 @@ private:
             if (!pkt.crc_ok && nid_resid_) {
                 // rotation hypothesis: shadow stream decoded under the
                 // net-ID-residual bin shift
-                build_bytes(nibbles_rot_, rot_bytes_, total);
-                if (crc_ok(rot_bytes_)) {
-                    memcpy(bytes, rot_bytes_, total);
+                build_bytes(u_.pay.nibbles_rot, u_.pay.rot_bytes, total);
+                if (crc_ok(u_.pay.rot_bytes)) {
+                    memcpy(bytes, u_.pay.rot_bytes, total);
                     pkt.crc_ok = true;
                 }
             }
