@@ -1818,6 +1818,10 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
         rtlsdr_set_tuner_gain(dev, cfg.gain);
     }
     rtlsdr_set_agc_mode(dev, cfg.rtl_agc ? 1 : 0);
+    fprintf(stderr, "RTL-SDR configured. Tuner gain: %.1f dB%s%s\n",
+            rtlsdr_get_tuner_gain(dev) / 10.0,
+            cfg.tuner_agc ? " (tuner AGC)" : "",
+            cfg.rtl_agc ? " (RTL2832 digital AGC)" : "");
 
     std::vector<unsigned char> buf(16384 * 16);
     for (int chunk = 0; g_running; chunk = (chunk + 1) % n_chunks) {
