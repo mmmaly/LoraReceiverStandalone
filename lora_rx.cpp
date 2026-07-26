@@ -1830,7 +1830,7 @@ struct SweepStat {
 static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &cfg,
                                           uint32_t tuner, const std::vector<SweepSpec> &specs,
                                           int dwell_s, std::vector<unsigned char> &buf,
-                                          bool settle) {
+                                          bool settle, double *keep_ratio = nullptr) {
     std::vector<SweepStat> stats;
     if (specs.empty()) return stats;
 
@@ -1866,7 +1866,9 @@ static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &c
             discarded += (uint32_t)n_read;
         }
     }
-    auto t_end = std::chrono::steady_clock::now() + std::chrono::seconds(dwell_s);
+    auto t_start = std::chrono::steady_clock::now();
+    auto t_end = t_start + std::chrono::seconds(dwell_s);
+    uint64_t bytes_read = 0;
     while (g_running && std::chrono::steady_clock::now() < t_end) {
         int n_read = 0;
         if (rtlsdr_read_sync(dev, buf.data(), (int)buf.size(), &n_read) < 0) {
@@ -1874,7 +1876,18 @@ static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &c
             g_running = false;
             break;
         }
-        if (n_read > 0) broadcast_u8(buf.data(), (uint32_t)n_read);
+        if (n_read > 0) {
+            bytes_read += (uint64_t)n_read;
+            broadcast_u8(buf.data(), (uint32_t)n_read);
+        }
+    }
+    // If the demodulators can't keep up, rtlsdr_read_sync is called too rarely
+    // and the device drops samples - which shreds frames mid-payload (sync and
+    // header survive, CRC never does). Measure it rather than let it be silent.
+    if (keep_ratio) {
+        double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+        double expected = elapsed * cfg.samp_rate * 2.0;
+        *keep_ratio = expected > 0 ? (double)bytes_read / expected : 1.0;
     }
 
     finish_workers();
@@ -1896,7 +1909,8 @@ static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &c
 }
 
 static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
-                     const std::vector<uint8_t> &sfs, const std::vector<uint32_t> &bws) {
+                     const std::vector<uint8_t> &sfs, const std::vector<uint32_t> &bws,
+                     size_t max_decoders, const char *dump_base) {
     const uint32_t raster = *std::min_element(bws.begin(), bws.end());
     const uint32_t maxbw = *std::max_element(bws.begin(), bws.end());
     const double usable = 0.75 * cfg.samp_rate;
@@ -1904,8 +1918,9 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
     double step = usable - 2.0 * maxbw;
     int n_chunks = span <= usable ? 1 : (int)ceil((span - usable) / step) + 1;
 
-    fprintf(stderr, "[sweep] %.4f-%.4f MHz, %d chunk(s) of %.0f kHz usable, dwell %d s, raster %u Hz\n",
-            f_lo / 1e6, f_hi / 1e6, n_chunks, usable / 1e3, dwell_s, raster);
+    fprintf(stderr, "[sweep] %.4f-%.4f MHz, %d chunk(s) of %.0f kHz usable, dwell %d s, raster %u Hz,"
+                    " max %zu decoder(s) at a time\n",
+            f_lo / 1e6, f_hi / 1e6, n_chunks, usable / 1e3, dwell_s, raster, max_decoders);
 
     rtlsdr_dev_t *dev = nullptr;
     if (rtlsdr_get_device_count() == 0) {
@@ -1931,6 +1946,35 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
             cfg.tuner_agc ? " (tuner AGC)" : "",
             cfg.rtl_agc ? " (RTL2832 digital AGC)" : "");
 
+    // Carriers proven real in an earlier cycle: always re-run, so a discovered
+    // network keeps being decoded even in cycles where nothing re-detects it.
+    std::vector<std::vector<SweepSpec>> known((size_t)n_chunks);
+
+    // Run `specs` in batches no larger than max_decoders. Oversubscribing the
+    // CPU makes the reader too slow and the dongle drops samples, so batching
+    // (sequential dwells at the same tuner position) is what keeps frames intact.
+    auto run_batched = [&](uint32_t tuner, const std::vector<SweepSpec> &specs,
+                           std::vector<unsigned char> &buf, bool first_settle) {
+        std::vector<SweepStat> all;
+        size_t n_batches = (specs.size() + max_decoders - 1) / max_decoders;
+        for (size_t b = 0; b < specs.size() && g_running; b += max_decoders) {
+            std::vector<SweepSpec> batch(specs.begin() + b,
+                                         specs.begin() + std::min(specs.size(), b + max_decoders));
+            if (n_batches > 1)
+                fprintf(stderr, "[sweep]   batch %zu/%zu (%zu decoders)\n",
+                        b / max_decoders + 1, n_batches, batch.size());
+            double keep = 1.0;
+            auto st = sweep_dwell(dev, cfg, tuner, batch, dwell_s, buf,
+                                  first_settle && b == 0, &keep);
+            if (keep < 0.95)
+                fprintf(stderr, "[sweep]   WARNING: only %.0f%% of samples kept - the dongle is"
+                                " dropping data because decoding can't keep up. Lower -M,"
+                                " or scan fewer SF/BW combinations.\n", keep * 100.0);
+            all.insert(all.end(), st.begin(), st.end());
+        }
+        return all;
+    };
+
     std::vector<unsigned char> buf(16384 * 16);
     for (int chunk = 0; g_running; chunk = (chunk + 1) % n_chunks) {
         double want = f_lo + usable / 2 + chunk * step;
@@ -1938,24 +1982,40 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
         if (want - usable / 2 < f_lo) want = f_lo + usable / 2;
         uint32_t tuner = (uint32_t)(llround((want - raster / 2.0) / raster) * raster + raster / 2);
 
-        std::vector<SweepSpec> coarse;
+        // Known carriers first (they decode directly), then the detection grid.
+        std::vector<SweepSpec> specs = known[(size_t)chunk];
         for (int64_t c = (int64_t)ceil((tuner - usable / 2) / (double)raster) * raster;
              c <= (int64_t)(tuner + usable / 2); c += raster) {
             if (c - maxbw / 2.0 < tuner - usable / 2 || c + maxbw / 2.0 > tuner + usable / 2) continue;
             if (c < f_lo - raster / 2.0 || c > f_hi + raster / 2.0) continue;
             for (uint32_t bw : bws)
                 for (uint8_t sf : sfs)
-                    coarse.push_back({(uint32_t)c, sf, bw});
+                    specs.push_back({(uint32_t)c, sf, bw});
         }
-        fprintf(stderr, "[sweep] chunk %d/%d: tuner %.4f MHz, %zu decoder(s) on the %u Hz grid\n",
-                chunk + 1, n_chunks, tuner / 1e6, coarse.size(), raster);
+        fprintf(stderr, "[sweep] chunk %d/%d: tuner %.4f MHz, %zu decoder(s)"
+                        " (%zu known carrier(s) + %u Hz grid)\n",
+                chunk + 1, n_chunks, tuner / 1e6, specs.size(), known[(size_t)chunk].size(), raster);
+
+        // Per-chunk IQ dump: one file per tuner position, so a replay always
+        // has a single well-defined centre frequency (a single mixed-tuner
+        // file cannot be replayed correctly at all).
+        if (dump_base) {
+            if (g_dump) fclose(g_dump);
+            char path[512];
+            snprintf(path, sizeof(path), "%s-%u.iq", dump_base, tuner);
+            g_dump = fopen(path, "ab");
+            if (g_dump)
+                fprintf(stderr, "[sweep]   dumping to %s (replay: ./lora_rx -r %s -s %u -f %u"
+                                " -C <carrier_hz> -S <sf> -b %u)\n",
+                        path, path, cfg.samp_rate, tuner, raster);
+            else
+                fprintf(stderr, "[sweep]   WARNING: cannot open dump %s\n", path);
+        }
 
         rtlsdr_set_center_freq(dev, tuner);
-        auto stats = sweep_dwell(dev, cfg, tuner, coarse, dwell_s, buf, true);
+        auto stats = run_batched(tuner, specs, buf, true);
         if (!g_running) break;
 
-        // Report the coarse pass and collect refine candidates: any detection
-        // whose CFO puts the real carrier more than a quarter bin away.
         std::vector<SweepSpec> refine;
         for (const auto &st : stats) {
             if (st.ok)
@@ -1965,24 +2025,34 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
                 fprintf(stderr, "[sweep]   DETECT %s%zu sync(s), CFO %+.1f bins -> carrier ~%.4f MHz\n",
                         st.tag.c_str(), st.syncs, st.med_cfo_bins, st.implied_hz / 1e6);
             if (st.syncs == 0 || fabs(st.med_cfo_bins) < 0.25) continue;
-            uint32_t rf = (uint32_t)llround(st.implied_hz / 500.0) * 500;  // 500 Hz resolution
+            uint32_t rf = (uint32_t)llround(st.implied_hz / 500.0) * 500;
             if (rf < f_lo - maxbw || rf > f_hi + maxbw) continue;
-            if (fabs((double)rf - tuner) + maxbw / 2.0 > usable / 2.0) continue;  // stays in-chunk
+            if (fabs((double)rf - tuner) + maxbw / 2.0 > usable / 2.0) continue;
             bool dup = false;
             for (const auto &r : refine)
                 if (r.sf == st.sf && r.bw == st.bw && labs((long)r.freq - (long)rf) < 500) dup = true;
-            if (!dup && refine.size() < 24) refine.push_back({rf, st.sf, st.bw});
+            if (!dup && refine.size() < max_decoders) refine.push_back({rf, st.sf, st.bw});
         }
         if (stats.empty()) fprintf(stderr, "[sweep]   nothing detected in this chunk\n");
 
         if (!refine.empty() && g_running) {
             fprintf(stderr, "[sweep]   refining %zu off-grid carrier(s) for %d s\n", refine.size(), dwell_s);
-            auto rstats = sweep_dwell(dev, cfg, tuner, refine, dwell_s, buf, false);
-            for (const auto &st : rstats)
+            auto rstats = run_batched(tuner, refine, buf, false);
+            for (const auto &st : rstats) {
                 fprintf(stderr, "[sweep]   %s %s%zu packet(s) CRC-ok, %zu sync(s), residual CFO %+.1f bins\n",
                         st.ok ? "REFINED HIT" : "refined", st.tag.c_str(), st.ok, st.syncs, st.med_cfo_bins);
+                // Remember carriers that actually produced frames here.
+                if (st.syncs == 0) continue;
+                auto &k = known[(size_t)chunk];
+                bool dup = false;
+                for (const auto &e : k)
+                    if (e.sf == st.sf && e.bw == st.bw && labs((long)e.freq - (long)st.freq) < 500) dup = true;
+                if (!dup && k.size() < max_decoders / 2)
+                    k.push_back({st.freq, st.sf, st.bw});
+            }
         }
     }
+    if (g_dump) { fclose(g_dump); g_dump = nullptr; }
     rtlsdr_close(dev);
     return 0;
 }
@@ -1993,9 +2063,10 @@ int main(int argc, char *argv[]) {
     const char *dump_file = nullptr;
     bool auto_mode = false, freq_given = false, samp_given = false;
     std::vector<long> sfs_cli, bws_cli, chans_cli, sweep_cli;
+    size_t max_decoders = 0;   // 0 = auto (see -W handling)
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:W:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:W:M:")) != -1) {
         switch (opt) {
         case 'f': cfg.freq = (uint32_t)atol(optarg); freq_given = true; break;
         case 's': cfg.samp_rate = (uint32_t)atol(optarg); samp_given = true; break;
@@ -2014,6 +2085,7 @@ int main(int argc, char *argv[]) {
         case 'A': auto_mode = true; break;
         case 'C': chans_cli = parse_list(optarg); break;
         case 'W': sweep_cli = parse_list(optarg); break;
+        case 'M': max_decoders = (size_t)atoi(optarg); break;
         default:
             fprintf(stderr, "Usage: %s [-f tuner_freq] [-s samp_rate] [-b bw[,bw..]] [-S sf[,sf..]] [-c cr]\n"
                             "          [-w sync_word_hex] [-g gain] [-G] [-p ppm] [-I] [-L pay_len] [-A]\n"
@@ -2023,6 +2095,8 @@ int main(int argc, char *argv[]) {
                             "  -W f_lo,f_hi[,dwell_s] sweeps the band in retuned chunks, running the full\n"
                             "     channel x SF x BW demod fan-out on each (survey scan; default\n"
                             "     dwell 30 s, BW 125k, SF 7-12; override with -b/-S/-s/-g/...)\n"
+                            "  -M <n> max decoders running at once in -W mode (default: CPU cores;\n"
+                            "     larger batches are split across sequential dwells)\n"
                             "  -r accepts rtl_sdr u8 IQ; a .C16 file is read as PortaPack int16 IQ,\n"
                             "     with tuner freq / sample rate defaulted from its Mayhem .TXT sidecar\n", argv[0]);
             return 1;
@@ -2086,13 +2160,14 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < 256; i++) g_u8lut[i] = ((float)i - 127.5f) / 127.5f;
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
-        if (dump_file) {
-            g_dump = fopen(dump_file, "wb");
-            if (g_dump) fprintf(stderr, "Dumping raw IQ to %s\n", dump_file);
+        if (max_decoders == 0) {
+            unsigned hw = std::thread::hardware_concurrency();
+            max_decoders = hw ? hw : 8;
         }
-        int rc = run_sweep(cfg, f_lo, f_hi, dwell, ssfs, sbws);
-        if (g_dump) fclose(g_dump);
-        return rc;
+        if (max_decoders < 2) max_decoders = 2;
+        // -D in sweep mode writes one file per tuner position (see run_sweep):
+        // a single file spanning retunes has no well-defined centre frequency.
+        return run_sweep(cfg, f_lo, f_hi, dwell, ssfs, sbws, max_decoders, dump_file);
     }
 
     // Channel list: default is a single channel at the tuner frequency
