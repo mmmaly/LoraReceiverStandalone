@@ -119,6 +119,17 @@ Diagnostics (with the decoder tag) go to stderr; `rx msg` / `rx str` / CRC lines
 
 The `sync=0x..` field reports the sync word actually detected in the frame — with `-w 0` this identifies an unknown network's sync word.
 
+## Measured sensitivity (vs a dedicated LoRa chip)
+
+Side-by-side test against a Seeed Wio (SX1262) on the same antenna position, 565 matched MeshCore SF7/62.5 kHz packets over ~95 minutes (packets matched by payload + timestamp between the Wio's RX log and this receiver's `rx ok`/`time=` output):
+
+- Overall, `lora_rx` (RTL-SDR v4, `-G -T`) decoded **67%** of what the SX1262 decoded; the SX1262 saw 89% of `lora_rx`'s packets.
+- Detection vs SNR (as reported by the Wio): ~93% above +6 dB, ~50% at −5 dB, a sharp cliff below −6 dB, nothing below −8 dB. The SX1262 itself still received down to −9.75 dB.
+- Net result: the RTL-SDR runs **roughly 4–5 dB behind a dedicated LoRa chip** — consistent with its ~6 dB noise figure plus 8-bit quantization against the SX1262's ~2–3 dB. An antenna-side SAW-filtered LNA would close most of that gap.
+- Receiver occupancy (busy decoding one frame when another arrives) costs only ~1% at this traffic level — sensitivity, not architecture, is the limit.
+
+The soft-decision demod and the CRC-guided recovery ladder (amplitude LLRs, rotation/nibble/symbol chase) are worth ~+20% decoded packets on real captures versus the plain pipeline; the chase marks recoveries that multiple error patterns could explain as `AMBIGUOUS` on stderr rather than presenting a coin-flip payload as certain.
+
 ## Offline testing
 
 `lora_tx_gen` synthesizes a complete LoRa frame (header, whitening, Hamming, interleaving, CRC) as an rtl_sdr-format IQ file:
