@@ -26,13 +26,13 @@ The `lora_lite.h` / `lora_kiss.h` core lives in the parent repo (and is copied i
 
 Wider SF/BW is a matter of raising `LORA_LITE_MAX_SF` and adding decimation stages, bounded by baseband SRAM.
 
-## Verification status (important, read before flashing)
+## Verification status
 
-- ✅ **DSP correctness**: `lora_lite` decodes real off-air MeshCore captures (63 CRC-valid packets from `capture.iq`, matching the full `lora_rx` where alignment allows) and clean synthetic frames SF7–SF10. Run `make check` in the parent repo.
-- ✅ **Compiles for the target**: both `lora_lite` and the baseband processor `proc_lorarx.cpp` compile cleanly with `arm-none-eabi-g++ 14.2` for `cortex-m4 -mfloat-abi=hard -mfpu=fpv4-sp-d16` against the real Mayhem headers.
-- ⚠️ **Not yet run on hardware, and the full firmware image was not linked here.** Mayhem's build is pinned to its own Docker toolchain (arm-none-eabi 9.2.1); a from-scratch image build outside that environment hit *pre-existing* CMake issues that also affect an unmodified `master` checkout (empty-sources on `application.elf` / `sd_over_usb`), i.e. unrelated to this app. Build the image in the official Mayhem dev container (below), where those targets resolve normally.
+- ✅ **Verified on hardware** (2026-07-27, HackRF One + PortaPack, Mayhem v2.2.0 1 MB build): receives live MeshCore traffic off-air — yellow detections and full CRC-valid decodes at SF7/62.5 kHz with an external antenna. Follow `BUILD_AND_FLASH.md` for the exact working build recipe (pinned gcc 9.2.1, no Docker needed).
+- ✅ **DSP correctness**: `lora_lite` decodes real off-air MeshCore captures (see the parent repo's regression suite; `make check` runs the `lite` cases) and clean synthetic frames SF7–SF10.
+- ⚠️ **Sensitivity is modest — set expectations accordingly.** The HackRF's front end and 8-bit ADC give up real dB against both a dedicated LoRa chip and an RTL-SDR running the host `lora_rx` (the parent repo measured the RTL-SDR itself ~4–5 dB behind an SX1262; the HackRF sits below that). It reliably hears strong-to-moderate local traffic; weak frames show as yellow detections (valid header, failed payload CRC) or not at all. A good antenna matters more here than anywhere else in this project.
 
-So: treat this as a compile-verified, DSP-proven app that needs an on-device shakedown. The UI app follows the `afsk_rx` template closely; the risk is in on-hardware integration (decimation levels, RSSI/AGC), not the demodulator.
+Practical settings that worked on air: correct SF first (networks differ — SF7 vs SF8 is the difference between traffic and silence), amp ON with LNA 32–40 / VGA ~40 on an external antenna. The RF path tolerates hot gain (no observed clipping in captures), but back off if the spectrum view saturates red.
 
 ## Build (official Mayhem dev container)
 
