@@ -187,6 +187,7 @@ struct LoRaConfig {
     int      ppm            = -3;
     uint16_t preamble_len   = 8;
     bool     soft_decoding  = true;
+    int      deep_level     = 0;    // -X: offline deep parameter search (0=off, 1-3)
 
     // derived
     uint32_t n_bins;
@@ -1338,7 +1339,27 @@ private:
     // header (wrong pay_len that passes the 5-bit checksum by luck) and the
     // payload. Re-parsing the header under the shifted timing recovers the
     // TRUE frame parameters. Returns true and fills the outputs on CRC pass.
-    bool redecode_frame(long delta, std::vector<uint8_t> &out_payload, bool &out_has_crc) {
+    // Swaps in an alternative demod downchirp for the lifetime of a decode,
+    // so the CFO hypothesis can vary without touching compute_LLRs_map.
+    struct ChirpGuard {
+        std::vector<cx> *slot;
+        std::vector<cx> saved;
+        ChirpGuard(std::vector<cx> *s, std::vector<cx> &&repl)
+            : slot(s), saved(std::move(*s)) { *slot = std::move(repl); }
+        ~ChirpGuard() { *slot = std::move(saved); }
+    };
+
+    bool redecode_frame(long delta, std::vector<uint8_t> &out_payload, bool &out_has_crc,
+                        float dcfo = 0.0f, float sfo_scale = 1.0f) {
+        std::unique_ptr<ChirpGuard> cguard;
+        if (dcfo != 0.0f) {
+            std::vector<cx> alt(N);
+            build_upchirp(alt.data(), mod(m_cfo_int, N), cfg.sf);
+            const float cf = m_cfo_frac + dcfo;
+            for (uint32_t i = 0; i < N; i++)
+                alt[i] = std::conj(alt[i]) * expj(-2.0f * (float)M_PI * cf / N * i);
+            cguard.reset(new ChirpGuard(&demod_downchirp, std::move(alt)));
+        }
         std::vector<cx> win(N);
         std::vector<std::array<double, MAX_SF>> blk;
         std::vector<uint8_t> nibs;
@@ -1391,7 +1412,7 @@ private:
                 consume -= sg;
                 scum -= sg * 1.0f / os;
             }
-            scum += sfo_hat;
+            scum += sfo_hat * sfo_scale;
             start += consume;
         }
         if (hdr) return false;
@@ -1429,6 +1450,51 @@ private:
             }
         }
         return 0;
+    }
+
+    // ---- Offline deep parameter search (-X) --------------------------------
+    //
+    // CFO, timing and SFO are estimated once, from ~4 preamble symbols, at
+    // whatever SNR the frame arrived with - the noisiest link in the chain,
+    // while the payload's 50-200 symbols carry far more information about the
+    // true values. Grid-search around the estimates, re-decoding the retained
+    // frame each time and accepting on CRC. Most hypotheses die after 8
+    // symbols (the re-parsed header must be self-consistent), so the average
+    // trial is far cheaper than a full frame.
+    //
+    // Offline only: -X refuses to run without -r.
+    bool deep_search(std::vector<uint8_t> &out_payload, bool &out_has_crc,
+                     float &hit_cfo, long &hit_delta, float &hit_sfo, size_t &tried) {
+        const int lvl = cfg.deep_level < 1 ? 1 : (cfg.deep_level > 3 ? 3 : cfg.deep_level);
+        // A whole-bin CFO error shifts every symbol; the deeper levels reach
+        // past +/-1 bin, where the (integer-only) rotation chase cannot help.
+        const float cfo_span[3] = {0.5f, 1.2f, 2.5f};
+        const float cfo_step = 0.05f;
+        // Timing is searched in whole samples = 1/os chip, i.e. finer than the
+        // retime chase's N/16-chip grid.
+        const long dmax[3] = {(long)os / 2, (long)os, (long)os};
+        static const float sfo_scales[5] = {1.0f, 0.0f, 0.5f, 1.5f, 2.0f};
+        const int n_sfo[3] = {1, 3, 5};
+        tried = 0;
+        for (int fi = 0; fi < n_sfo[lvl - 1]; fi++) {
+            for (int ci = 0; ; ci++) {
+                // walk outwards from the current estimate: 0, +s, -s, +2s, ...
+                float dc = cfo_step * ((ci + 1) / 2) * ((ci % 2) ? -1.0f : 1.0f);
+                if (fabsf(dc) > cfo_span[lvl - 1]) break;
+                for (long dd = 0; dd <= dmax[lvl - 1]; dd++) {
+                    for (int sgn : {1, -1}) {
+                        long delta = dd * sgn;
+                        if (dd == 0 && sgn < 0) continue;
+                        tried++;
+                        if (!redecode_frame(delta, out_payload, out_has_crc, dc, sfo_scales[fi]))
+                            continue;
+                        hit_cfo = dc; hit_delta = delta; hit_sfo = sfo_scales[fi];
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     void assemble_and_output() {
@@ -1476,6 +1542,7 @@ private:
                 } else {
                     std::vector<uint8_t> rt_payload;
                     bool rt_crc = true;
+                    float dp_cfo = 0, dp_sfo = 1; long dp_delta = 0; size_t dp_tried = 0;
                     if (long delta = retime_chase(rt_payload, rt_crc)) {
                         // re-demod may have recovered a DIFFERENT (true)
                         // header, so adopt its length/CRC flag wholesale
@@ -1487,6 +1554,17 @@ private:
                         std::lock_guard<std::mutex> lk(g_print_mtx);
                         fprintf(stderr, "%s  Retime chase: CRC ok at %+ld sample shift (pay_len=%u)\n",
                                 tag.c_str(), delta, m_pay_len);
+                    } else if (cfg.deep_level > 0 &&
+                               deep_search(rt_payload, rt_crc, dp_cfo, dp_delta, dp_sfo, dp_tried)) {
+                        m_pay_len = (uint32_t)rt_payload.size();
+                        m_pay_has_crc = rt_crc;
+                        bytes = rt_payload;
+                        pkt.has_crc = rt_crc;
+                        pkt.crc_valid = true;
+                        std::lock_guard<std::mutex> lk(g_print_mtx);
+                        fprintf(stderr, "%s  Deep search: CRC ok at dCFO=%+.2f bins, %+ld samples,"
+                                        " SFO x%.1f after %zu hypotheses (pay_len=%u)\n",
+                                tag.c_str(), dp_cfo, dp_delta, dp_sfo, dp_tried, m_pay_len);
                     } else if (getenv("LORA_DEBUG_FAIL")) {
                         dump_failed_frame();
                     }
@@ -2066,7 +2144,7 @@ int main(int argc, char *argv[]) {
     size_t max_decoders = 0;   // 0 = auto (see -W handling)
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:W:M:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:W:M:X:")) != -1) {
         switch (opt) {
         case 'f': cfg.freq = (uint32_t)atol(optarg); freq_given = true; break;
         case 's': cfg.samp_rate = (uint32_t)atol(optarg); samp_given = true; break;
@@ -2086,6 +2164,7 @@ int main(int argc, char *argv[]) {
         case 'C': chans_cli = parse_list(optarg); break;
         case 'W': sweep_cli = parse_list(optarg); break;
         case 'M': max_decoders = (size_t)atoi(optarg); break;
+        case 'X': cfg.deep_level = atoi(optarg); break;
         default:
             fprintf(stderr, "Usage: %s [-f tuner_freq] [-s samp_rate] [-b bw[,bw..]] [-S sf[,sf..]] [-c cr]\n"
                             "          [-w sync_word_hex] [-g gain] [-G] [-p ppm] [-I] [-L pay_len] [-A]\n"
@@ -2095,6 +2174,8 @@ int main(int argc, char *argv[]) {
                             "  -W f_lo,f_hi[,dwell_s] sweeps the band in retuned chunks, running the full\n"
                             "     channel x SF x BW demod fan-out on each (survey scan; default\n"
                             "     dwell 30 s, BW 125k, SF 7-12; override with -b/-S/-s/-g/...)\n"
+                            "  -X <1-3> deep parameter search on CRC-failed frames (file replay only):\n"
+                            "     re-decodes each failed frame over a CFO/timing/SFO grid\n"
                             "  -M <n> max decoders running at once in -W mode (default: CPU cores;\n"
                             "     larger batches are split across sequential dwells)\n"
                             "  -r accepts rtl_sdr u8 IQ; a .C16 file is read as PortaPack int16 IQ,\n"
@@ -2107,6 +2188,12 @@ int main(int argc, char *argv[]) {
     // before any derived configuration is computed
     if (iq_file && is_c16_file(iq_file))
         load_c16_sidecar(iq_file, cfg, freq_given, samp_given);
+
+    if (cfg.deep_level > 0 && !iq_file) {
+        fprintf(stderr, "-X is an offline mode: it needs -r <file> (it re-decodes each failed\n"
+                        "frame hundreds to thousands of times and cannot keep up with live RX)\n");
+        return 1;
+    }
 
     for (long sf : sfs_cli) {
         if (sf < MIN_SF || sf > MAX_SF) {
