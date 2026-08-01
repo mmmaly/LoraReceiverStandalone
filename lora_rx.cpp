@@ -1931,7 +1931,8 @@ static void sweep_async_cb(unsigned char *buf, uint32_t len, void *ctx_) {
 static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &cfg,
                                           uint32_t tuner, const std::vector<SweepSpec> &specs,
                                           int dwell_s, std::vector<unsigned char> &buf,
-                                          bool settle, double *keep_ratio = nullptr) {
+                                          bool settle, double *keep_ratio = nullptr,
+                                          const char *replay = nullptr) {
     std::vector<SweepStat> stats;
     if (specs.empty()) return stats;
 
@@ -1957,6 +1958,42 @@ static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &c
             g_workers.emplace_back(new DemodWorker(c, make_tag(sp.freq, sp.sf, sp.bw), sbuf));
             ch.workers.push_back(g_workers.back().get());
         }
+    }
+
+    if (replay) {
+        // Offline discovery: one full pass over the recording per batch.
+        // Nothing can be dropped here, so there is no kept-sample ratio.
+        FILE *f = fopen(replay, "rb");
+        if (!f) { perror("replay"); finish_workers(); g_workers.clear(); g_channels.clear(); return stats; }
+        bool c16 = is_c16_file(replay);
+        if (c16) {
+            std::vector<int16_t> sb(buf.size() / 2);
+            size_t nr;
+            while (g_running && (nr = fread(sb.data(), sizeof(int16_t), sb.size(), f)) > 0)
+                broadcast_s16(sb.data(), nr);
+        } else {
+            size_t nr;
+            while (g_running && (nr = fread(buf.data(), 1, buf.size(), f)) > 0)
+                broadcast_u8(buf.data(), (uint32_t)nr);
+        }
+        fclose(f);
+        if (keep_ratio) *keep_ratio = 1.0;
+        finish_workers();
+        size_t wi2 = 0;
+        for (uint32_t chf : freqs) {
+            for (const auto &sp : specs) {
+                if (sp.freq != chf) continue;
+                DemodWorker *w = g_workers[wi2++].get();
+                if (w->sync_count() == 0 && w->packet_count() == 0) continue;
+                float cfo = w->median_sync_cfo();
+                double bin_hz = (double)sp.bw / (double)(1u << sp.sf);
+                stats.push_back({w->tag(), sp.freq, sp.sf, sp.bw, w->sync_count(), w->crc_ok_count(),
+                                 cfo, (double)sp.freq + cfo * bin_hz});
+            }
+        }
+        g_workers.clear();
+        g_channels.clear();
+        return stats;
     }
 
     // Every batch starts with a fresh buffer: the device kept streaming during
@@ -1999,7 +2036,8 @@ static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &c
 
 static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
                      const std::vector<uint8_t> &sfs, const std::vector<uint32_t> &bws,
-                     size_t max_decoders, const char *dump_base) {
+                     size_t max_decoders, const char *dump_base, const char *replay = nullptr) {
+    const bool offline = (replay != nullptr);
     const uint32_t raster = *std::min_element(bws.begin(), bws.end());
     const uint32_t maxbw = *std::max_element(bws.begin(), bws.end());
     const double usable = 0.75 * cfg.samp_rate;
@@ -2008,7 +2046,8 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
     // with a very wide BW that formula can go non-positive, so clamp it.
     double step = usable - 2.0 * maxbw;
     if (step < usable / 4.0) step = usable / 4.0;
-    int n_chunks = span <= usable ? 1 : (int)ceil((span - usable) / step) + 1;
+    // A recording has exactly one tuner position; there is nothing to retune.
+    int n_chunks = offline ? 1 : (span <= usable ? 1 : (int)ceil((span - usable) / step) + 1);
 
     // Spell out exactly what will be scanned: silently scanning a narrower set
     // than the user expects looks identical to "there is no traffic here".
@@ -2021,13 +2060,20 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
         for (uint32_t v : bws) bwl += (bwl.empty() ? "" : ",") + std::to_string(v / 1000) + "k";
         size_t per_chunk = (size_t)floor(usable / raster) * sfs.size() * bws.size();
         size_t batches = (per_chunk + max_decoders - 1) / max_decoders;
-        double cycle = (double)n_chunks * batches * dwell_s;
-        fprintf(stderr, "[sweep] scanning SF %s at BW %s (samp_rate %u); ~%zu decoders/chunk"
-                        " -> ~%zu batch(es), full cycle ~%.0f min\n",
-                sfl.c_str(), bwl.c_str(), cfg.samp_rate, per_chunk, batches, cycle / 60.0);
+        if (offline) {
+            fprintf(stderr, "[sweep] offline scan of %s: SF %s at BW %s; ~%zu decoders"
+                            " -> %zu pass(es) over the file\n",
+                    replay, sfl.c_str(), bwl.c_str(), per_chunk, batches);
+        } else {
+            double cycle = (double)n_chunks * batches * dwell_s;
+            fprintf(stderr, "[sweep] scanning SF %s at BW %s (samp_rate %u); ~%zu decoders/chunk"
+                            " -> ~%zu batch(es), full cycle ~%.0f min\n",
+                    sfl.c_str(), bwl.c_str(), cfg.samp_rate, per_chunk, batches, cycle / 60.0);
+        }
     }
 
     rtlsdr_dev_t *dev = nullptr;
+    if (!offline) {
     if (rtlsdr_get_device_count() == 0) {
         fprintf(stderr, "No RTL-SDR devices found\n");
         return 1;
@@ -2050,6 +2096,7 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
             rtlsdr_get_tuner_gain(dev) / 10.0,
             cfg.tuner_agc ? " (tuner AGC)" : "",
             cfg.rtl_agc ? " (RTL2832 digital AGC)" : "");
+    }
 
     // Carriers proven real in an earlier cycle: always re-run, so a discovered
     // network keeps being decoded even in cycles where nothing re-detects it.
@@ -2070,7 +2117,7 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
                         b / max_decoders + 1, n_batches, batch.size());
             double keep = 1.0;
             auto st = sweep_dwell(dev, cfg, tuner, batch, dwell_s, buf,
-                                  first_settle && b == 0, &keep);
+                                  first_settle && b == 0, &keep, replay);
             if (keep < 0.95)
                 fprintf(stderr, "[sweep]   WARNING: only %.0f%% of samples kept - the dongle is"
                                 " dropping data because decoding can't keep up. Lower -M,"
@@ -2093,7 +2140,9 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
             if (want + usable / 2 > f_hi) want = f_hi - usable / 2;
             if (want - usable / 2 < f_lo) want = f_lo + usable / 2;
         }
-        uint32_t tuner = (uint32_t)(llround((want - raster / 2.0) / raster) * raster + raster / 2);
+        // Offline the centre is whatever the file was recorded at.
+        uint32_t tuner = offline ? cfg.freq
+                                 : (uint32_t)(llround((want - raster / 2.0) / raster) * raster + raster / 2);
 
         // Known carriers first (they decode directly), then the detection grid.
         std::vector<SweepSpec> specs = known[(size_t)chunk];
@@ -2112,7 +2161,7 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
         // Per-chunk IQ dump: one file per tuner position, so a replay always
         // has a single well-defined centre frequency (a single mixed-tuner
         // file cannot be replayed correctly at all).
-        if (dump_base) {
+        if (dump_base && !offline) {
             if (g_dump) fclose(g_dump);
             char path[512];
             snprintf(path, sizeof(path), "%s-%u.iq", dump_base, tuner);
@@ -2125,7 +2174,7 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
                 fprintf(stderr, "[sweep]   WARNING: cannot open dump %s\n", path);
         }
 
-        rtlsdr_set_center_freq(dev, tuner);
+        if (!offline) rtlsdr_set_center_freq(dev, tuner);
         auto stats = run_batched(tuner, specs, buf, true);
         if (!g_running) break;
 
@@ -2164,9 +2213,10 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
                     k.push_back({st.freq, st.sf, st.bw});
             }
         }
+        if (offline) break;   // a file is finite; scan it once and stop
     }
     if (g_dump) { fclose(g_dump); g_dump = nullptr; }
-    rtlsdr_close(dev);
+    if (!offline) rtlsdr_close(dev);
     return 0;
 }
 
@@ -2209,6 +2259,8 @@ int main(int argc, char *argv[]) {
                             "  -W f_lo,f_hi[,dwell_s] sweeps the band in retuned chunks, running the full\n"
                             "     channel x SF x BW demod fan-out on each (survey scan; default\n"
                             "     dwell 30 s, BW 125k, SF 7-12; override with -b/-S/-s/-g/...)\n"
+                            "  -W with -r scans a RECORDING across the channel grid (offline discovery;\n"
+                            "     needs -f, one pass over the file per batch)\n"
                             "  -X <1-3> deep parameter search on CRC-failed frames (file replay only):\n"
                             "     re-decodes each failed frame over a CFO/timing/SFO grid\n"
                             "  -M <n> max decoders running at once in -W mode (default: 4x CPU cores;\n"
@@ -2251,8 +2303,9 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "-W needs f_lo,f_hi[,dwell_seconds]\n");
             return 1;
         }
-        if (iq_file) {
-            fprintf(stderr, "-W is a live-SDR mode and cannot be combined with -r\n");
+        if (iq_file && !freq_given) {
+            fprintf(stderr, "-W -r needs the recording's centre frequency: add -f <hz>\n"
+                            "(a sweep dump's replay hint prints it; .C16 files take it from the sidecar)\n");
             return 1;
         }
         double f_lo = (double)sweep_cli[0], f_hi = (double)sweep_cli[1];
@@ -2272,8 +2325,8 @@ int main(int argc, char *argv[]) {
             if (auto_mode) sbws = {62500, 125000, 250000, 500000};
             else sbws = {125000};
         }
-        if (!samp_given) {
-            // widest reliably-stable RTL rate that keeps every BW ratio <= 16
+        if (!samp_given && !iq_file) {
+            // widest reliably-stable RTL rate that keeps every BW ratio <= 32
             uint32_t min_bw = *std::min_element(sbws.begin(), sbws.end());
             cfg.samp_rate = std::min<uint32_t>(2000000, 32 * min_bw);
         }
@@ -2298,7 +2351,7 @@ int main(int argc, char *argv[]) {
         if (max_decoders < 2) max_decoders = 2;
         // -D in sweep mode writes one file per tuner position (see run_sweep):
         // a single file spanning retunes has no well-defined centre frequency.
-        return run_sweep(cfg, f_lo, f_hi, dwell, ssfs, sbws, max_decoders, dump_file);
+        return run_sweep(cfg, f_lo, f_hi, dwell, ssfs, sbws, max_decoders, dump_file, iq_file);
     }
 
     // Channel list: default is a single channel at the tuner frequency

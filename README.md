@@ -106,6 +106,33 @@ CRC-valid packets additionally emit a machine-readable `rx ok: <hex>` line (plai
 
 Non-packet lines pass through the decoder untouched, so channel attribution and CRC status stay visible in the combined output.
 
+### Offline discovery from a recording
+
+`-W` also works on a recorded file (`-r`), which is how you extract packets from a
+sweep dump when you do **not** know the network's frequency, SF or bandwidth. It
+applies the same channel grid x SF x BW fan-out to the recording, one pass per
+batch, then reports what it found:
+
+```bash
+# the recording's centre frequency is required (-f); the sweep's own dump hint prints it
+./lora_rx -r sweep-869062500.iq -s 2000000 -f 869062500 -W 867000000,871000000 -A
+...
+[sweep] offline scan of sweep-869062500.iq: SF 7,8,9,10,11,12 at BW 62k,125k,250k,500k; ~576 decoders -> 13 pass(es)
+[sweep]   HIT [869.4375M SF7/62.5k] 108 packet(s) CRC-ok, 135 sync(s), CFO -9.9 bins
+```
+
+The `HIT` line names the parameters; `CFO x bw / 2^sf` gives the carrier offset from
+the grid point (here -9.9 bins ~ -4.8 kHz, i.e. a real carrier at 869.4327 MHz).
+Then decode it directly for the full packet list:
+
+```bash
+./lora_rx -r sweep-869062500.iq -s 2000000 -f 869062500 -C 869432000 -S 7 -b 62500
+```
+
+Cost is `#decoders x recording length / throughput` and is CPU-bound, so a blind
+`-A` scan of a long recording takes a while (28 min of IQ x 576 decoders ~ 30 min
+here). Narrow it with `-S`/`-b` as soon as you have a hypothesis.
+
 ### Output
 
 ```
