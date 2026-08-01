@@ -1903,6 +1903,29 @@ struct SweepStat {
     double implied_hz;   // freq + CFO, i.e. where the transmitter really is
 };
 
+// Continuous streaming for one dwell. rtlsdr_read_sync has no double
+// buffering - every sample that arrives while the caller is outside the read
+// call is dropped by the USB stack, which cost 5-10% of the stream regardless
+// of how little CPU the decoders used. The async API keeps 15 transfers
+// queued, so the device never streams into a closed door.
+struct SweepAsyncCtx {
+    rtlsdr_dev_t *dev = nullptr;
+    std::chrono::steady_clock::time_point settle_until, deadline, first;
+    bool started = false;
+    uint64_t bytes = 0;
+};
+
+static void sweep_async_cb(unsigned char *buf, uint32_t len, void *ctx_) {
+    auto *c = static_cast<SweepAsyncCtx *>(ctx_);
+    if (!g_running) { rtlsdr_cancel_async(c->dev); return; }
+    auto now = std::chrono::steady_clock::now();
+    if (now < c->settle_until) return;              // PLL/AGC settling, discarded
+    if (!c->started) { c->started = true; c->first = now; }
+    if (now >= c->deadline) { rtlsdr_cancel_async(c->dev); return; }
+    c->bytes += len;
+    broadcast_u8(buf, len);
+}
+
 // Build the worker fan-out for `specs`, stream `dwell_s` seconds through it,
 // then tear it down and return per-worker statistics.
 static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &cfg,
@@ -1936,32 +1959,20 @@ static std::vector<SweepStat> sweep_dwell(rtlsdr_dev_t *dev, const LoRaConfig &c
         }
     }
 
-    if (settle) {
-        rtlsdr_reset_buffer(dev);
-        for (uint32_t discarded = 0; discarded < cfg.samp_rate / 5 && g_running;) {
-            int n_read = 0;
-            if (rtlsdr_read_sync(dev, buf.data(), (int)buf.size(), &n_read) < 0 || n_read <= 0) break;
-            discarded += (uint32_t)n_read;
-        }
-    }
-    auto t_start = std::chrono::steady_clock::now();
-    auto t_end = t_start + std::chrono::seconds(dwell_s);
-    uint64_t bytes_read = 0;
-    while (g_running && std::chrono::steady_clock::now() < t_end) {
-        int n_read = 0;
-        if (rtlsdr_read_sync(dev, buf.data(), (int)buf.size(), &n_read) < 0) {
-            fprintf(stderr, "[sweep] read error, stopping\n");
-            g_running = false;
-            break;
-        }
-        if (n_read > 0) {
-            bytes_read += (uint64_t)n_read;
-            broadcast_u8(buf.data(), (uint32_t)n_read);
-        }
-    }
-    // If the demodulators can't keep up, rtlsdr_read_sync is called too rarely
-    // and the device drops samples - which shreds frames mid-payload (sync and
-    // header survive, CRC never does). Measure it rather than let it be silent.
+    // Every batch starts with a fresh buffer: the device kept streaming during
+    // the previous batch's teardown, so whatever is queued is stale.
+    rtlsdr_reset_buffer(dev);
+    SweepAsyncCtx ctx;
+    ctx.dev = dev;
+    auto now0 = std::chrono::steady_clock::now();
+    ctx.settle_until = now0 + std::chrono::milliseconds(settle ? 200 : 60);
+    ctx.deadline = ctx.settle_until + std::chrono::seconds(dwell_s);
+    ctx.first = ctx.settle_until;
+    rtlsdr_read_async(dev, sweep_async_cb, &ctx, 0, (uint32_t)buf.size());
+    uint64_t bytes_read = ctx.bytes;
+    auto t_start = ctx.started ? ctx.first : ctx.settle_until;
+    // Sample-loss check: dropouts land mid-frame, so sync and header survive
+    // while the payload CRC never does. Measure it rather than let it be silent.
     if (keep_ratio) {
         double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
         double expected = elapsed * cfg.samp_rate * 2.0;
@@ -2176,7 +2187,7 @@ int main(int argc, char *argv[]) {
                             "     dwell 30 s, BW 125k, SF 7-12; override with -b/-S/-s/-g/...)\n"
                             "  -X <1-3> deep parameter search on CRC-failed frames (file replay only):\n"
                             "     re-decodes each failed frame over a CFO/timing/SFO grid\n"
-                            "  -M <n> max decoders running at once in -W mode (default: CPU cores;\n"
+                            "  -M <n> max decoders running at once in -W mode (default: 4x CPU cores;\n"
                             "     larger batches are split across sequential dwells)\n"
                             "  -r accepts rtl_sdr u8 IQ; a .C16 file is read as PortaPack int16 IQ,\n"
                             "     with tuner freq / sample rate defaulted from its Mayhem .TXT sidecar\n", argv[0]);
@@ -2248,8 +2259,12 @@ int main(int argc, char *argv[]) {
         signal(SIGINT, signal_handler);
         signal(SIGTERM, signal_handler);
         if (max_decoders == 0) {
+            // Decoding is far cheaper than the batching cost: 24 decoders at
+            // 2 MS/s measured 6.6x real-time on an 8-core laptop, while each
+            // extra batch multiplies a chunk's wall time by another dwell.
+            // Run wide by default; the kept-sample warning is the guardrail.
             unsigned hw = std::thread::hardware_concurrency();
-            max_decoders = hw ? hw : 8;
+            max_decoders = (hw ? hw : 8) * 4;
         }
         if (max_decoders < 2) max_decoders = 2;
         // -D in sweep mode writes one file per tuner position (see run_sweep):
