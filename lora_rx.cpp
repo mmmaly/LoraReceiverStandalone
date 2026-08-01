@@ -2004,12 +2004,28 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
     const uint32_t maxbw = *std::max_element(bws.begin(), bws.end());
     const double usable = 0.75 * cfg.samp_rate;
     const double span = f_hi - f_lo;
+    // Overlap by one max-BW so edge channels land inside some chunk's interior;
+    // with a very wide BW that formula can go non-positive, so clamp it.
     double step = usable - 2.0 * maxbw;
+    if (step < usable / 4.0) step = usable / 4.0;
     int n_chunks = span <= usable ? 1 : (int)ceil((span - usable) / step) + 1;
 
+    // Spell out exactly what will be scanned: silently scanning a narrower set
+    // than the user expects looks identical to "there is no traffic here".
     fprintf(stderr, "[sweep] %.4f-%.4f MHz, %d chunk(s) of %.0f kHz usable, dwell %d s, raster %u Hz,"
                     " max %zu decoder(s) at a time\n",
             f_lo / 1e6, f_hi / 1e6, n_chunks, usable / 1e3, dwell_s, raster, max_decoders);
+    {
+        std::string sfl, bwl;
+        for (uint8_t v : sfs) sfl += (sfl.empty() ? "" : ",") + std::to_string((int)v);
+        for (uint32_t v : bws) bwl += (bwl.empty() ? "" : ",") + std::to_string(v / 1000) + "k";
+        size_t per_chunk = (size_t)floor(usable / raster) * sfs.size() * bws.size();
+        size_t batches = (per_chunk + max_decoders - 1) / max_decoders;
+        double cycle = (double)n_chunks * batches * dwell_s;
+        fprintf(stderr, "[sweep] scanning SF %s at BW %s (samp_rate %u); ~%zu decoders/chunk"
+                        " -> ~%zu batch(es), full cycle ~%.0f min\n",
+                sfl.c_str(), bwl.c_str(), cfg.samp_rate, per_chunk, batches, cycle / 60.0);
+    }
 
     rtlsdr_dev_t *dev = nullptr;
     if (rtlsdr_get_device_count() == 0) {
@@ -2066,9 +2082,17 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
 
     std::vector<unsigned char> buf(16384 * 16);
     for (int chunk = 0; g_running; chunk = (chunk + 1) % n_chunks) {
-        double want = f_lo + usable / 2 + chunk * step;
-        if (want + usable / 2 > f_hi) want = f_hi - usable / 2;
-        if (want - usable / 2 < f_lo) want = f_lo + usable / 2;
+        // A span narrower than one chunk must be CENTRED, not pinned to an
+        // edge: the two clamps below would otherwise fight and park the window
+        // outside the requested range entirely.
+        double want;
+        if (span <= usable) {
+            want = (f_lo + f_hi) / 2.0;
+        } else {
+            want = f_lo + usable / 2 + chunk * step;
+            if (want + usable / 2 > f_hi) want = f_hi - usable / 2;
+            if (want - usable / 2 < f_lo) want = f_lo + usable / 2;
+        }
         uint32_t tuner = (uint32_t)(llround((want - raster / 2.0) / raster) * raster + raster / 2);
 
         // Known carriers first (they decode directly), then the detection grid.
@@ -2242,15 +2266,20 @@ int main(int argc, char *argv[]) {
         if (ssfs.empty()) ssfs = {7, 8, 9, 10, 11, 12};
         std::vector<uint32_t> sbws;
         for (long v : bws_cli) sbws.push_back((uint32_t)v);
-        if (sbws.empty()) sbws = {125000};
+        if (sbws.empty()) {
+            // -A means "scan everything" here too. Without it the sweep would
+            // silently look at 125 kHz only and miss, say, a 62.5 kHz mesh.
+            if (auto_mode) sbws = {62500, 125000, 250000, 500000};
+            else sbws = {125000};
+        }
         if (!samp_given) {
             // widest reliably-stable RTL rate that keeps every BW ratio <= 16
             uint32_t min_bw = *std::min_element(sbws.begin(), sbws.end());
-            cfg.samp_rate = std::min<uint32_t>(2000000, 16 * min_bw);
+            cfg.samp_rate = std::min<uint32_t>(2000000, 32 * min_bw);
         }
         for (uint32_t bw : sbws) {
-            if (cfg.samp_rate % bw != 0 || cfg.samp_rate / bw > 16) {
-                fprintf(stderr, "-W: samp_rate %u is not a usable multiple of bw %u (need integer ratio <= 16)\n",
+            if (cfg.samp_rate % bw != 0 || cfg.samp_rate / bw > 32) {
+                fprintf(stderr, "-W: samp_rate %u is not a usable multiple of bw %u (need integer ratio <= 32)\n",
                         cfg.samp_rate, bw);
                 return 1;
             }
@@ -2307,8 +2336,10 @@ int main(int argc, char *argv[]) {
     if (sfs.empty()) sfs = auto_mode ? std::vector<uint8_t>{7, 8, 9, 10, 11, 12} : std::vector<uint8_t>{cfg.sf};
     if (bws.empty()) {
         if (auto_mode) {
+            // os up to 32: at 2 MS/s that is what 62.5 kHz needs, and it
+            // decodes fine there - capping at 16 silently hid whole networks.
             for (uint32_t bw : {62500u, 125000u, 250000u, 500000u}) {
-                if (bw <= cfg.samp_rate && cfg.samp_rate % bw == 0 && cfg.samp_rate / bw <= 16)
+                if (bw <= cfg.samp_rate && cfg.samp_rate % bw == 0 && cfg.samp_rate / bw <= 32)
                     bws.push_back(bw);
             }
         }
