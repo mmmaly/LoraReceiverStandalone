@@ -78,17 +78,27 @@ void LoRaRxView::on_packet(const LoRaPacketData& pkt) {
     std::string line = "\x1B";
     line += col;
     line += to_string_dec_uint(packet_count) + ": ";
-    if (pkt.status == 2) {
-        for (uint8_t i = 0; i < pkt.len; i++) line += to_string_hex(pkt.data[i], 2);
-    } else if (pkt.status == 1) {
-        line += "CRC-FAIL len=" + to_string_dec_uint(pkt.hdr_len);
-    } else {
+    if (pkt.status == 0) {
         line += "DETECTED len=" + to_string_dec_uint(pkt.hdr_len);
+    } else {
+        // Payload bytes: solid decode, or best-effort ("?") on CRC-fail.
+        if (pkt.status == 1) line += "? ";
+        for (uint8_t i = 0; i < pkt.len; i++) line += to_string_hex(pkt.data[i], 2);
     }
     console.writeln(line);
 
+    // Payload as text when it is all printable ASCII (host's "rx str")
+    bool printable = pkt.status != 0 && pkt.len > 0;
+    for (uint8_t i = 0; i < pkt.len && printable; i++)
+        printable = pkt.data[i] >= 0x20 && pkt.data[i] <= 0x7e;
+    if (printable) {
+        std::string text = " \"";
+        for (uint8_t i = 0; i < pkt.len; i++) text += (char)pkt.data[i];
+        console.writeln(text + "\"");
+    }
+
     std::string info = "  SNR " + to_string_dec_int((int)pkt.snr) +
-                       " sync " + to_string_hex(pkt.sync, 2) +
+                       " CFO " + to_string_decimal(pkt.cfo, 1) +
                        " ok=" + to_string_dec_uint(decoded_count);
     console.writeln(info);
 }
