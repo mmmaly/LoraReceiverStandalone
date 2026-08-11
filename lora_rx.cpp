@@ -215,6 +215,7 @@ public:
         bool crc_valid;
         bool has_crc;
         float snr_est;
+        float cfo_est; // bins, int + frac, as estimated at sync
     };
 
     std::vector<Packet> last_packets;
@@ -433,6 +434,7 @@ public:
                             snr_e = 10.0f * log10f(sig_e / (tot_e - sig_e));
                     }
                     current_snr = snr_e;
+                    current_cfo = m_cfo_int + m_cfo_frac;
 
                     state = PAYLOAD;
                     payload_symbol_cnt = 0;
@@ -621,6 +623,7 @@ private:
     int down_val;
     unsigned int frame_cnt = 0;
     float current_snr;
+    float current_cfo = 0;
     float frame_sfo_cum0 = 0;
 
     // Payload demod state
@@ -1505,6 +1508,7 @@ private:
         Packet pkt;
         pkt.has_crc = m_pay_has_crc;
         pkt.snr_est = current_snr;
+        pkt.cfo_est = current_cfo;
         pkt.crc_valid = false;
         int chase_n = 0;
 
@@ -1580,14 +1584,17 @@ private:
 
             // Wall-clock reception time (epoch seconds, ms precision) so
             // offline log comparisons don't need to reconstruct timing from
-            // packet matching. Always printed: single-config runs get a
-            // bare "rx cfg: time=..." line. Downstream is unaffected - the
-            // dekoduj scripts grep "rx msg"/"rx ok" and meshcore-decoder
-            // stream passes unknown lines through.
+            // packet matching, plus the preamble SNR and CFO estimates
+            // (previously stderr-only in the [sync] line). Always printed:
+            // single-config runs get a bare "rx cfg: snr=... cfo=... time=..."
+            // line. Downstream is unaffected - the dekoduj scripts grep
+            // "rx msg"/"rx ok" and meshcore-decoder stream passes unknown
+            // lines through.
             struct timeval tv;
             gettimeofday(&tv, nullptr);
-            printf("rx cfg: %s%stime=%ld.%03d\n",
+            printf("rx cfg: %s%ssnr=%.1f cfo=%.2f time=%ld.%03d\n",
                    stdout_tag.c_str(), stdout_tag.empty() ? "" : " ",
+                   pkt.snr_est, pkt.cfo_est,
                    (long)tv.tv_sec, (int)(tv.tv_usec / 1000));
             printf("rx msg: ");
             for (uint32_t i = 0; i < m_pay_len; i++) {
