@@ -95,7 +95,7 @@ make check      # builds the offline frame generator and runs end-to-end tests (
 
 `-S` and `-b` accept comma-separated lists; each channel gets a decoder for every SF x BW combination. In auto-scan mode they act as filters: `-A -S 9` scans only bandwidths at SF9; `-A -b 125000` scans only SFs at 125 kHz. `-A` combines with `-C` (all SF/BW on every channel).
 
-When more than one decoder runs, each packet on stdout is preceded by a `rx cfg: freq=... sf=... bw=...` line identifying which channel/decoder produced it (the `rx msg` / `rx str` / CRC line format itself is unchanged).
+Each packet on stdout is preceded by a `rx cfg:` line carrying the preamble SNR estimate, the CFO estimate (in bins) and reception wall-clock time (`rx cfg: snr=-6.5 cfo=2.87 time=1723370000.123`); when more than one decoder runs it also identifies which channel/decoder produced the packet (`rx cfg: freq=... sf=... bw=... snr=... cfo=... time=...`). The `rx msg` / `rx str` / CRC line format itself is unchanged.
 
 CRC-valid packets additionally emit a machine-readable `rx ok: <hex>` line (plain hex, one line per packet), designed for piping into a packet decoder. For MeshCore, [meshcore-cpp-decoder](https://github.com/mmmaly/meshcore-cpp-decoder) consumes it directly with its `stream` command:
 
