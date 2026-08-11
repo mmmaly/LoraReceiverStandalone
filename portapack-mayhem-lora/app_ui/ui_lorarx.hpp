@@ -74,7 +74,12 @@ class LoRaRxView : public View {
         9,
         {{"sync 12", 0x12}, {"sync 34", 0x34}, {"sync any", 0x00}}};
 
-    Console console{{0, 3 * 16, screen_width, screen_height - 3 * 16}};
+    // Height must keep the console's physical bottom on the panel: views sit
+    // below the 16 px status bar, so top(48) + height + 16 must be <= 320.
+    // One line too tall and the ILI9341 scroll region is invalid - the log
+    // fills the screen once and never scrolls (that bug shipped; acars_rx
+    // uses the same 48/256 geometry).
+    Console console{{0, 3 * 16, screen_width, screen_height - 3 * 16 - 16}};
 
     MessageHandlerRegistration message_handler_packet{
         Message::ID::LoRaRxPacket,
