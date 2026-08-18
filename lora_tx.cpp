@@ -108,6 +108,11 @@ static bool load_packets(const char *path, bool as_text, std::vector<TxItem> &it
 }
 
 #ifdef HAVE_HACKRF
+// libhackrf keeps TRANSFER_COUNT (4) buffers of TRANSFER_BUFFER_SIZE (256 KB)
+// in flight; at 2 MS/s that is a quarter second of samples queued ahead of
+// whatever the callback has just handed over.
+static constexpr size_t HACKRF_QUEUE_BYTES = 4 * 262144;
+
 struct TxState {
     const int8_t *buf = nullptr;
     size_t len = 0;
@@ -357,9 +362,15 @@ int main(int argc, char *argv[]) {
                 break;
             }
             while (g_running && st.pos < st.len) usleep(2000);
-            // Let the queued buffers drain before dropping the carrier, or the
-            // frame's last symbols never reach the antenna
-            usleep(50000);
+            // The callback handing over the last sample only means libhackrf
+            // has it, not that it has been radiated: a full USB transfer queue
+            // still sits ahead of it. The callback feeds silence from here on,
+            // so wait out that backlog before dropping the carrier. Stopping
+            // early truncates the tail of the frame -- which is the payload,
+            // leaving a receiver that locks on and decodes the header cleanly
+            // and then sees nothing but noise where the payload should be.
+            double drain = (double)(HACKRF_QUEUE_BYTES / 2) / samp_rate + 0.1;
+            usleep((useconds_t)(drain * 1e6));
             hackrf_stop_tx(dev);
             sent++;
 
