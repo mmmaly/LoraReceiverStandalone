@@ -13,6 +13,13 @@ ifeq ($(UNAME_S),Darwin)
   LDFLAGS  += -L$(BREW_PREFIX)/lib
 endif
 
+# Optional HackRF input backend (-H): compiled in when libhackrf is present
+HACKRF_LIBS := $(shell pkg-config --libs libhackrf 2>/dev/null)
+ifneq ($(HACKRF_LIBS),)
+  CXXFLAGS += -DHAVE_HACKRF $(shell pkg-config --cflags libhackrf 2>/dev/null)
+  LDFLAGS  += $(HACKRF_LIBS)
+endif
+
 TARGET = lora_rx
 TXGEN  = lora_tx_gen
 

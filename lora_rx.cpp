@@ -30,6 +30,8 @@
 //     -D <file>         Dump raw IQ to file while receiving (for later replay with -r)
 //     -d <n|substr>     Select RTL-SDR by index or by a case-insensitive substring
 //                       of its "manufacturer product serial" USB strings (default 0)
+//     -H <lna[,vga[,amp]]>  Receive from a HackRF instead of an RTL-SDR
+//                       (LNA 0-40 dB, VGA 0-62 dB, amp 0/1; default 40,40,0)
 
 #include <cstdio>
 #include <cstdlib>
@@ -51,7 +53,11 @@
 #include <strings.h>
 #include <sys/time.h>
 #include <getopt.h>
+#include <unistd.h>
 #include <rtl-sdr.h>
+#ifdef HAVE_HACKRF
+#include <libhackrf/hackrf.h>
+#endif
 
 extern "C" {
 #include "kiss_fft.h"
@@ -1929,6 +1935,18 @@ static void rtlsdr_callback(unsigned char *buf, uint32_t len, void *) {
     broadcast_u8(buf, len);
 }
 
+#ifdef HAVE_HACKRF
+static int hackrf_callback(hackrf_transfer *t) {
+    if (!g_running) return -1;
+    // HackRF delivers signed 8-bit IQ; the pipeline eats rtl_sdr offset-128
+    // u8, and two's complement -> offset binary is just a sign-bit flip.
+    unsigned char *b = t->buffer;
+    for (int i = 0; i < t->valid_length; i++) b[i] ^= 0x80;
+    broadcast_u8(b, (uint32_t)t->valid_length);
+    return 0;
+}
+#endif
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -2308,11 +2326,13 @@ int main(int argc, char *argv[]) {
     const char *iq_file = nullptr;
     const char *dump_file = nullptr;
     bool auto_mode = false, freq_given = false, samp_given = false;
+    bool use_hackrf = false;
+    long hrf_lna = 40, hrf_vga = 40, hrf_amp = 0;
     std::vector<long> sfs_cli, bws_cli, chans_cli, sweep_cli;
     size_t max_decoders = 0;   // 0 = auto (see -W handling)
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:W:M:X:d:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:W:M:X:d:H:")) != -1) {
         switch (opt) {
         case 'f': cfg.freq = (uint32_t)atol(optarg); freq_given = true; break;
         case 's': cfg.samp_rate = (uint32_t)atol(optarg); samp_given = true; break;
@@ -2334,12 +2354,27 @@ int main(int argc, char *argv[]) {
         case 'M': max_decoders = (size_t)atoi(optarg); break;
         case 'X': cfg.deep_level = atoi(optarg); break;
         case 'd': g_dev_sel = optarg; break;
+        case 'H': {
+            use_hackrf = true;
+            std::vector<long> v = parse_list(optarg);
+            if (v.size() > 0) hrf_lna = v[0];
+            if (v.size() > 1) hrf_vga = v[1];
+            if (v.size() > 2) hrf_amp = v[2];
+            if (hrf_lna < 0 || hrf_lna > 40 || hrf_vga < 0 || hrf_vga > 62) {
+                fprintf(stderr, "-H: LNA gain is 0-40 dB, VGA gain 0-62 dB\n");
+                return 1;
+            }
+            break;
+        }
         default:
             fprintf(stderr, "Usage: %s [-f tuner_freq] [-s samp_rate] [-b bw[,bw..]] [-S sf[,sf..]] [-c cr]\n"
                             "          [-w sync_word_hex] [-g gain] [-G] [-p ppm] [-I] [-L pay_len] [-A]\n"
                             "          [-C chan_freq[,chan_freq..]] [-r iq_file] [-D dump_file] [-d dev]\n"
                             "  -d selects the RTL-SDR: an index, or a case-insensitive substring of\n"
                             "     the device's \"manufacturer product serial\" USB strings (default 0)\n"
+                            "  -H lna[,vga[,amp]] receives from a HackRF instead of an RTL-SDR:\n"
+                            "     LNA gain 0-40 dB, VGA gain 0-62 dB, amp 0/1 (default 40,40,0);\n"
+                            "     min samp_rate 2 MS/s (auto-raised), -p folded into the tune freq\n"
                             "  -G enables the RTL2832 internal digital AGC\n"
                             "  -T enables the R820T analog tuner AGC (overrides -g)\n"
                             "  -W f_lo,f_hi[,dwell_s] sweeps the band in retuned chunks, running the full\n"
@@ -2385,6 +2420,10 @@ int main(int argc, char *argv[]) {
 
     // Sweep mode: hardware retuning + software fan-out, then exit
     if (!sweep_cli.empty()) {
+        if (use_hackrf) {
+            fprintf(stderr, "-W sweep drives the RTL-SDR tuner directly; -H is not supported there\n");
+            return 1;
+        }
         if (sweep_cli.size() < 2) {
             fprintf(stderr, "-W needs f_lo,f_hi[,dwell_seconds]\n");
             return 1;
@@ -2448,6 +2487,16 @@ int main(int argc, char *argv[]) {
     // Multi-channel needs enough span; default to 1 MS/s unless -s was given
     if (channels.size() > 1 && !samp_given)
         cfg.samp_rate = 1000000;
+
+    // The HackRF ADC is not specified below 2 MS/s (aliasing); raise a lower
+    // default, refuse a lower explicit request
+    if (use_hackrf && !iq_file && cfg.samp_rate < 2000000) {
+        if (samp_given) {
+            fprintf(stderr, "-H: HackRF minimum sample rate is 2000000 (asked for %u)\n", cfg.samp_rate);
+            return 1;
+        }
+        cfg.samp_rate = 2000000;
+    }
 
     // Tuner center: explicit -f wins; otherwise midpoint of the channels
     // (which places the RTL-SDR DC spike between them, outside every channel)
@@ -2587,6 +2636,42 @@ int main(int argc, char *argv[]) {
                 broadcast_u8(buf.data(), (uint32_t)nr);
         }
         if (f != stdin) fclose(f);
+    } else if (use_hackrf) {
+        // ---- Live: HackRF ----
+#ifndef HAVE_HACKRF
+        fprintf(stderr, "This build has no HackRF support (libhackrf was not found at build time)\n");
+        finish_workers();
+        return 1;
+#else
+        hackrf_device *hdev = nullptr;
+        if (hackrf_init() != HACKRF_SUCCESS || hackrf_open(&hdev) != HACKRF_SUCCESS) {
+            fprintf(stderr, "Failed to open HackRF\n");
+            finish_workers();
+            return 1;
+        }
+        // libhackrf has no frequency-correction knob, so -p (same sign
+        // convention as rtlsdr: positive = crystal runs fast) is folded
+        // into the hardware tune frequency
+        uint64_t tune = (uint64_t)llround((double)tuner_freq * (1.0 - cfg.ppm * 1e-6));
+        hackrf_set_freq(hdev, tune);
+        hackrf_set_sample_rate(hdev, cfg.samp_rate);
+        hackrf_set_baseband_filter_bandwidth(hdev,
+            hackrf_compute_baseband_filter_bw_round_down_lt(cfg.samp_rate));
+        hackrf_set_amp_enable(hdev, hrf_amp ? 1 : 0);
+        hackrf_set_lna_gain(hdev, (uint32_t)hrf_lna);
+        hackrf_set_vga_gain(hdev, (uint32_t)hrf_vga);
+        fprintf(stderr, "HackRF configured. LNA %ld dB, VGA %ld dB, amp %s%s\n",
+                hrf_lna, hrf_vga, hrf_amp ? "ON" : "off",
+                cfg.ppm ? " (ppm folded into tune freq)" : "");
+        fprintf(stderr, "Listening...\n\n");
+
+        hackrf_start_rx(hdev, hackrf_callback, nullptr);
+        while (g_running && hackrf_is_streaming(hdev) == HACKRF_TRUE)
+            usleep(100 * 1000);
+        hackrf_stop_rx(hdev);
+        hackrf_close(hdev);
+        hackrf_exit();
+#endif
     } else {
         // ---- Live: RTL-SDR ----
         rtlsdr_dev_t *dev = open_rtl_device();
