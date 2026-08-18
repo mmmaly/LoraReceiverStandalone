@@ -158,6 +158,22 @@ Side-by-side test against a Seeed Wio (SX1262) on the same antenna position, 565
 - Net result: the RTL-SDR runs **roughly 4–5 dB behind a dedicated LoRa chip** — consistent with its ~6 dB noise figure plus 8-bit quantization against the SX1262's ~2–3 dB. An antenna-side SAW-filtered LNA would close most of that gap.
 - Receiver occupancy (busy decoding one frame when another arrives) costs only ~1% at this traffic level — sensitivity, not architecture, is the limit.
 
+### Between receivers
+
+Three receivers on one host decoding the same live MeshCore traffic for 96 minutes (1663 distinct transmissions, matched between logs by payload + timestamp):
+
+| Receiver | Sensitivity vs Blog V4 | Share of all transmissions decoded |
+|---|---|---|
+| RTL-SDR Blog V4, `-G -T` | reference | 77% |
+| HackRF One, `-H 40,40,0` (**identical antenna**) | **−0.9 dB** | 58% |
+| Generic RTL2838UHIDIR, `-p 70` (worse antenna) | **−1.9 dB** | 62% |
+
+Method note worth keeping: bucketing the paired SNR deltas by the *reference* receiver's own SNR makes the penalty appear to grow without bound (−2 dB overall, −4.7 dB above 0 dB, −6.5 dB above +6 dB). That is regression to the mean — conditioning on a noisy estimate selects that receiver's favourable noise draws. With three receivers the fix is to condition on the **third** receiver, whose noise is independent of the two being compared; the figures above then hold steady across every threshold, and the three pairwise deltas agree (V4→HackRF −0.9, V4→UHIDIR −1.9, and HackRF−UHIDIR measured +1.0).
+
+Misses are signal-driven rather than random loss: every receiver decodes far more of the transmissions the other two both heard (86%/66%/65%) than of those only one other heard (64%/49%/44%).
+
+Combined with the SX1262 comparison above, the HackRF lands roughly **5–6 dB** behind a dedicated LoRa chip. Its RF amp must stay **off** in this band — enabling it overloaded the unfiltered front end and cost ~6 dB SNR and 4/5 of decoded packets; raising the VGA past 40 dB gained nothing.
+
 Offline, `-X` adds a deep parameter search on frames that still fail (see the option table). It is worth about **+1 packet per 100** on clean captures - small, but every recovery so far has verified as genuine MeshCore traffic, including an Advert with a valid Ed25519 signature (which cannot pass by chance). The interesting part is *why* they failed: one needed a 1-sample timing shift (finer than any earlier stage searched), one needed the SFO drift correction disabled, one needed -0.75 CFO bins. Those are estimator errors, not noise - which is why more CPU can fix them and a better antenna cannot.
 
 The soft-decision demod and the CRC-guided recovery ladder (amplitude LLRs, rotation/nibble/symbol chase) are worth ~+20% decoded packets on real captures versus the plain pipeline; the chase marks recoveries that multiple error patterns could explain as `AMBIGUOUS` on stderr rather than presenting a coin-flip payload as certain.
@@ -210,6 +226,11 @@ With `-t` each line is sent as literal text instead of hex.
 | `-O <hz>` | Transmit offset from the LO so its leakage falls outside the channel; `0` puts the LO on the channel | samp_rate/4 |
 | `-o <file>` | Write baseband IQ instead of transmitting (decode with `lora_rx -r`) | — |
 | `-N` | Dry run: encode, report airtime, transmit nothing | off |
+
+Verified on air: HackRF transmitting, RTL-SDR receiving, text and hex payloads round-tripping byte-exact down to −10 dB SNR. Two lessons from that bring-up, both invisible to the file loopback:
+
+- **Levels matter more than you would expect at close range.** With the receiver on AGC (`-G -T`) a transmitter a few centimetres away drove 30% of the ADC samples into the rails; a clipped LoRa chirp still syncs and still yields a *valid header*, so the failure looks like a decoder bug rather than overload. The AGC sets gain from wideband average power between bursts, then the burst clips. Use a manual receive gain for close-range tests.
+- **A transmit call returning is not the same as the signal having been radiated.** See the drain comment in `lora_tx.cpp`: libhackrf keeps ~0.26 s of samples queued at 2 MS/s, so stopping when the callback runs dry truncates the frame's tail. The symptom was a perfectly decoded header followed by noise where the payload should be, at every gain and every SNR.
 
 **Transmitting is regulated.** The EU 868 MHz ISM band limits how long a device may occupy a channel, so `lora_tx` enforces a duty cycle by idling after each frame (default 1%, the conservative sub-band figure — 869.4–869.65 MHz permits 10%) and never leaves the PA keyed between frames. A SF12/62.5 kHz frame is 2.3 s of airtime, which at 1% means ~4 minutes of silence after it; `-N` reports the numbers before anything is radiated. Check what your license and local regulations allow before raising `-y`, `-g`, or `-a`.
 
