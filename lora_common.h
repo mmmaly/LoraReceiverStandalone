@@ -8,6 +8,9 @@
 
 using cx = std::complex<float>;
 
+// Symbols longer than this switch to low data rate optimization
+inline constexpr double LORA_LDRO_MAX_MS = 16.0;
+
 inline long mod(long a, long b) { return ((a % b) + b) % b; }
 
 inline cx expj(float phase) { return cx(cosf(phase), sinf(phase)); }

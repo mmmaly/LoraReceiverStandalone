@@ -2,7 +2,7 @@
 
 Standalone LoRa packet receiver in pure C/C++. No GNU Radio dependency.
 
-Connects directly to an RTL-SDR dongle (or replays a recorded IQ file) and implements the full LoRa PHY demodulation chain:
+Connects directly to an RTL-SDR dongle or a HackRF (or replays a recorded IQ file) and implements the full LoRa PHY demodulation chain:
 
 - Anti-alias low-pass FIR before decimation (~5 dB sensitivity gain at 4x oversampling)
 - Preamble detection with CFO/STO estimation (Bernier + RCTSL algorithms)
@@ -171,7 +171,47 @@ The soft-decision demod and the CRC-guided recovery ladder (amplitude LLRs, rota
 ./lora_rx -r test.iq -A          # decodes it, reports [SF9/125k]
 ```
 
-Options: `-N <sigma>` additive noise, `-O <hz>` carrier frequency offset, `-a <amp>` amplitude, `-w <hex>` sync word. `./run_tests.sh` (or `make check`) runs an end-to-end suite covering SF7-SF12, LDRO, CFO, noise, auto-scan, and sync-word detection.
+Options: `-N <sigma>` additive noise, `-O <hz>` carrier frequency offset, `-a <amp>` amplitude, `-w <hex>` sync word. `./run_tests.sh` (or `make check`) runs an end-to-end suite covering SF7-SF12, LDRO, CFO, noise, auto-scan, sync-word detection, and the transmitter's own loopback.
+
+## Transmitting (`lora_tx`)
+
+`lora_tx` is the counterpart to `lora_rx`: the same PHY option letters (`-f -s -b -S -c -w -p`), the same encoder as `lora_tx_gen` (shared in `lora_frame.h`), transmitted over a **HackRF**.
+
+```bash
+./lora_tx -f 869618000 -S 7 -b 62500 -m "HELLO MESH"      # one text packet
+./lora_tx -f 869618000 -S 7 -x 2e0092293a8d               # one hex packet
+./lora_tx -f 869618000 -S 7 -r packets.txt -n 3           # a list, three passes
+grep "rx ok" obe-pakety.txt | ./lora_tx -f 869618000 -S 7 -r -   # replay a capture
+./lora_tx -S 7 -m "TEST" -o out.iq && ./lora_rx -r out.iq -S 7 -b 62500 -s 2000000
+```
+
+The packet file is one packet per line, and deliberately accepts `lora_rx`'s own output so a capture log replays on air without editing:
+
+```
+# comment lines and blank lines are ignored
+rx ok: 2e0092293a8dc83dee23a8a01e415cc15d    a line copied from lora_rx
+aa:bb:cc:dd ee ff                            hex, separators optional
+@2.5                                         wait 2.5 s before the next packet
+```
+
+With `-t` each line is sent as literal text instead of hex.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-m <text>` / `-x <hex>` | One packet from the command line (repeatable) | — |
+| `-r <file>` | Packet list, `-` = stdin | — |
+| `-t` | Input lines are text, not hex | off |
+| `-n <count>` | Repeat the whole list; `0` = until interrupted | 1 |
+| `-G <sec>` | Gap between packets | 1.0 |
+| `-y <pct>` | **Duty cycle cap**: idle after each frame so on-air time stays under this share of the channel. `0` disables it. | 1.0 |
+| `-g <0-47>` | HackRF TX VGA gain (dB) | 20 |
+| `-a` | Enable the HackRF RF amp (+11 dB) | off |
+| `-L <0-1>` | Digital amplitude; 1.0 risks DAC clipping | 0.7 |
+| `-O <hz>` | Transmit offset from the LO so its leakage falls outside the channel; `0` puts the LO on the channel | samp_rate/4 |
+| `-o <file>` | Write baseband IQ instead of transmitting (decode with `lora_rx -r`) | — |
+| `-N` | Dry run: encode, report airtime, transmit nothing | off |
+
+**Transmitting is regulated.** The EU 868 MHz ISM band limits how long a device may occupy a channel, so `lora_tx` enforces a duty cycle by idling after each frame (default 1%, the conservative sub-band figure — 869.4–869.65 MHz permits 10%) and never leaves the PA keyed between frames. A SF12/62.5 kHz frame is 2.3 s of airtime, which at 1% means ~4 minutes of silence after it; `-N` reports the numbers before anything is radiated. Check what your license and local regulations allow before raising `-y`, `-g`, or `-a`.
 
 ## License
 

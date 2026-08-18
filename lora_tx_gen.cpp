@@ -17,10 +17,7 @@
 #include <getopt.h>
 
 #include "lora_common.h"
-
-static uint8_t reverse4(uint8_t d) {
-    return (uint8_t)(((d & 1) << 3) | (((d >> 1) & 1) << 2) | (((d >> 2) & 1) << 1) | ((d >> 3) & 1));
-}
+#include "lora_frame.h"
 
 int main(int argc, char *argv[]) {
     uint32_t samp_rate = 250000, bw = 62500;
@@ -58,94 +55,19 @@ int main(int argc, char *argv[]) {
     if (cr < 1 || cr > 4) { fprintf(stderr, "CR must be 1-4\n"); return 1; }
     if (payload.size() < 2 || payload.size() > 255) { fprintf(stderr, "payload must be 2-255 bytes\n"); return 1; }
 
-    int os = samp_rate / bw;
-    uint32_t N = 1u << sf;
-    uint32_t sps = N * os;
-    bool ldro = (double)N * 1000.0 / bw > 16.0;
-    uint32_t paylen = (uint32_t)payload.size();
+    FrameParams fp;
+    fp.sf = sf;
+    fp.cr = cr;
+    fp.sync_word = sync_word;
+    fp.os = samp_rate / bw;
+    fp.id_offset = id_offset;
+    fp.pre_silence = pre_silence;
+    fp.tail_silence = 4 * (1u << sf) * fp.os;
 
-    // ---- Nibble stream: explicit header (5) + whitened payload + CRC ----
-    std::vector<uint8_t> nib;
-    uint8_t n0 = (paylen >> 4) & 0xF, n1 = paylen & 0xF;
-    uint8_t n2 = (uint8_t)((cr << 1) | 1); // CRC present
-    auto b = [](uint8_t v, int k) { return (v >> k) & 1; };
-    int c4 = b(n0, 3) ^ b(n0, 2) ^ b(n0, 1) ^ b(n0, 0);
-    int c3 = b(n0, 3) ^ b(n1, 3) ^ b(n1, 2) ^ b(n1, 1) ^ b(n2, 0);
-    int c2 = b(n0, 2) ^ b(n1, 3) ^ b(n1, 0) ^ b(n2, 3) ^ b(n2, 1);
-    int c1 = b(n0, 1) ^ b(n1, 2) ^ b(n1, 0) ^ b(n2, 2) ^ b(n2, 1) ^ b(n2, 0);
-    int c0 = b(n0, 0) ^ b(n1, 1) ^ b(n2, 3) ^ b(n2, 2) ^ b(n2, 1) ^ b(n2, 0);
-    nib.push_back(n0);
-    nib.push_back(n1);
-    nib.push_back(n2);
-    nib.push_back((uint8_t)c4);
-    nib.push_back((uint8_t)((c3 << 3) | (c2 << 2) | (c1 << 1) | c0));
+    FrameInfo fi;
+    std::vector<cx> sig = build_lora_frame((const uint8_t *)payload.data(),
+                                           payload.size(), fp, bw, &fi);
 
-    for (uint32_t i = 0; i < paylen; i++) {
-        uint8_t w = (uint8_t)payload[i] ^ whitening_seq[i];
-        nib.push_back(w & 0xF);
-        nib.push_back(w >> 4);
-    }
-
-    uint16_t crc = crc16((const uint8_t *)payload.data(), paylen - 2);
-    crc = crc ^ (uint8_t)payload[paylen - 1] ^ ((uint16_t)(uint8_t)payload[paylen - 2] << 8);
-    nib.push_back(crc & 0xF);
-    nib.push_back((crc >> 4) & 0xF);
-    nib.push_back((crc >> 8) & 0xF);
-    nib.push_back((crc >> 12) & 0xF);
-
-    // ---- Encode blocks -> chirp ids ----
-    std::vector<uint32_t> ids;
-    size_t pos = 0;
-    bool first = true;
-    while (pos < nib.size()) {
-        int sf_app = (first || ldro) ? sf - 2 : sf;
-        int cw_len = first ? 8 : cr + 4;
-        int cr_app = first ? 4 : cr;
-
-        // Hamming-encode sf_app nibbles into codeword rows (pad with 0)
-        std::vector<uint8_t> rows(sf_app);
-        for (int i = 0; i < sf_app; i++) {
-            uint8_t d = pos < nib.size() ? nib[pos++] : 0;
-            uint8_t rev = reverse4(d);
-            rows[i] = (uint8_t)((cr_app != 1 ? cw_LUT[rev] : cw_LUT_cr5[rev]) >> (8 - cw_len));
-        }
-
-        // Diagonal interleave + inverse Gray -> chirp id per symbol
-        for (int i = 0; i < cw_len; i++) {
-            uint32_t s = 0;
-            for (int j = 0; j < sf_app; j++) {
-                int r = (int)mod(i - j - 1, sf_app);
-                int bit = (rows[r] >> (cw_len - 1 - i)) & 1;
-                s |= (uint32_t)bit << (sf_app - 1 - j);
-            }
-            uint32_t v = s;
-            v ^= v >> 1; v ^= v >> 2; v ^= v >> 4; v ^= v >> 8;
-            uint32_t val = (first || ldro) ? v * 4 : v;
-            ids.push_back((uint32_t)mod((long)val + id_offset, N));
-        }
-        first = false;
-    }
-
-    // ---- Synthesize samples ----
-    std::vector<cx> sym(sps), sig;
-    sig.reserve(pre_silence + (13 + ids.size()) * sps);
-    sig.resize(pre_silence, cx(0, 0));
-
-    auto up = [&](uint32_t id) {
-        build_upchirp(sym.data(), id, (uint8_t)sf, (uint8_t)os);
-        sig.insert(sig.end(), sym.begin(), sym.end());
-    };
-
-    for (int i = 0; i < 8; i++) up(0);                          // preamble
-    up((uint32_t)(((sync_word & 0xF0) >> 4) << 3));             // net id 1
-    up((uint32_t)((sync_word & 0x0F) << 3));                    // net id 2
-    build_upchirp(sym.data(), 0, (uint8_t)sf, (uint8_t)os);     // 2.25 downchirps
-    for (auto &z : sym) z = std::conj(z);
-    sig.insert(sig.end(), sym.begin(), sym.end());
-    sig.insert(sig.end(), sym.begin(), sym.end());
-    sig.insert(sig.end(), sym.begin(), sym.begin() + sps / 4);
-    for (uint32_t id : ids) up(id);                             // payload
-    sig.resize(sig.size() + 4 * sps, cx(0, 0));                 // tail silence
 
     // ---- CFO, noise, quantize to u8, write ----
     FILE *f = fopen(out_path, "wb");
@@ -181,6 +103,6 @@ int main(int argc, char *argv[]) {
     fclose(f);
 
     fprintf(stderr, "wrote %s: %zu IQ samples, %zu payload symbols (SF%d, BW %u, os %d%s, CR 4/%d)\n",
-            out_path, sig.size(), ids.size(), sf, bw, os, ldro ? ", LDRO" : "", cr + 4);
+            out_path, sig.size(), fi.payload_symbols, sf, bw, fp.os, fi.ldro ? ", LDRO" : "", cr + 4);
     return 0;
 }
