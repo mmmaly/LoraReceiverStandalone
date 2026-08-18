@@ -28,6 +28,8 @@
 //                       .C16 files are read as PortaPack int16 IQ, with tuner freq and
 //                       sample rate defaulted from the Mayhem .TXT sidecar
 //     -D <file>         Dump raw IQ to file while receiving (for later replay with -r)
+//     -d <n|substr>     Select RTL-SDR by index or by a case-insensitive substring
+//                       of its "manufacturer product serial" USB strings (default 0)
 
 #include <cstdio>
 #include <cstdlib>
@@ -76,6 +78,85 @@ static void signal_handler(int) {
 
 static_assert(sizeof(cx) == sizeof(kiss_fft_cpx),
               "std::complex<float> must be layout-compatible with kiss_fft_cpx");
+
+// ============================================================================
+// Device selection
+// ============================================================================
+//
+// Two dongles on one host is a normal setup here (the known-good stick keeps
+// running the production RX while another one is tested), and cheap sticks
+// all ship with serial 00000001, so -d accepts an index or a case-insensitive
+// substring of the "manufacturer product serial" USB strings.
+
+static const char *g_dev_sel = nullptr;
+
+static void list_rtl_devices(int n) {
+    for (int i = 0; i < n; i++) {
+        char m[256] = "", p[256] = "", s[256] = "";
+        if (rtlsdr_get_device_usb_strings(i, m, p, s) != 0)
+            snprintf(p, sizeof(p), "%s", rtlsdr_get_device_name(i));
+        fprintf(stderr, "  %d: %s %s SN:%s\n", i, m, p, s);
+    }
+}
+
+// Resolve -d to a device index; -1 (with devices listed) when it can't.
+static int resolve_rtl_device(void) {
+    int n = rtlsdr_get_device_count();
+    if (n == 0) {
+        fprintf(stderr, "No RTL-SDR devices found\n");
+        return -1;
+    }
+    if (!g_dev_sel) return 0;
+    char *end = nullptr;
+    long idx = strtol(g_dev_sel, &end, 10);
+    if (end != g_dev_sel && *end == '\0') {
+        if (idx < 0 || idx >= n) {
+            fprintf(stderr, "-d %ld: no such device index, found %d device(s):\n", idx, n);
+            list_rtl_devices(n);
+            return -1;
+        }
+        return (int)idx;
+    }
+    int match = -1;
+    for (int i = 0; i < n; i++) {
+        char m[256] = "", p[256] = "", s[256] = "";
+        rtlsdr_get_device_usb_strings(i, m, p, s);
+        char full[800];
+        snprintf(full, sizeof(full), "%s %s %s", m, p, s);
+        if (strcasestr(full, g_dev_sel)) {
+            if (match >= 0) {
+                fprintf(stderr, "-d '%s' matches more than one device:\n", g_dev_sel);
+                list_rtl_devices(n);
+                return -1;
+            }
+            match = i;
+        }
+    }
+    if (match < 0) {
+        fprintf(stderr, "-d '%s' matches no device:\n", g_dev_sel);
+        list_rtl_devices(n);
+        return -1;
+    }
+    return match;
+}
+
+// Open the -d selected device, announcing which physical stick was picked
+// (essential when two dongles carry identical serials).
+static rtlsdr_dev_t *open_rtl_device(void) {
+    int dev_index = resolve_rtl_device();
+    if (dev_index < 0) return nullptr;
+    char m[256] = "", p[256] = "", s[256] = "";
+    if (rtlsdr_get_device_usb_strings(dev_index, m, p, s) != 0)
+        snprintf(p, sizeof(p), "%s", rtlsdr_get_device_name(dev_index));
+    rtlsdr_dev_t *dev = nullptr;
+    if (rtlsdr_open(&dev, (uint32_t)dev_index) < 0) {
+        fprintf(stderr, "Failed to open device %d: %s %s SN:%s (busy?)\n",
+                dev_index, m, p, s);
+        return nullptr;
+    }
+    fprintf(stderr, "Opened device %d: %s %s SN:%s\n", dev_index, m, p, s);
+    return dev;
+}
 
 // ============================================================================
 // Utility functions
@@ -2081,14 +2162,9 @@ static int run_sweep(LoRaConfig cfg, double f_lo, double f_hi, int dwell_s,
 
     rtlsdr_dev_t *dev = nullptr;
     if (!offline) {
-    if (rtlsdr_get_device_count() == 0) {
-        fprintf(stderr, "No RTL-SDR devices found\n");
+    dev = open_rtl_device();
+    if (!dev)
         return 1;
-    }
-    if (rtlsdr_open(&dev, 0) < 0) {
-        fprintf(stderr, "Failed to open RTL-SDR device\n");
-        return 1;
-    }
     g_dev = dev;
     rtlsdr_set_sample_rate(dev, cfg.samp_rate);
     rtlsdr_set_freq_correction(dev, cfg.ppm);
@@ -2236,7 +2312,7 @@ int main(int argc, char *argv[]) {
     size_t max_decoders = 0;   // 0 = auto (see -W handling)
     int opt;
 
-    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:W:M:X:")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:g:GTp:IL:r:D:AC:W:M:X:d:")) != -1) {
         switch (opt) {
         case 'f': cfg.freq = (uint32_t)atol(optarg); freq_given = true; break;
         case 's': cfg.samp_rate = (uint32_t)atol(optarg); samp_given = true; break;
@@ -2257,10 +2333,13 @@ int main(int argc, char *argv[]) {
         case 'W': sweep_cli = parse_list(optarg); break;
         case 'M': max_decoders = (size_t)atoi(optarg); break;
         case 'X': cfg.deep_level = atoi(optarg); break;
+        case 'd': g_dev_sel = optarg; break;
         default:
             fprintf(stderr, "Usage: %s [-f tuner_freq] [-s samp_rate] [-b bw[,bw..]] [-S sf[,sf..]] [-c cr]\n"
                             "          [-w sync_word_hex] [-g gain] [-G] [-p ppm] [-I] [-L pay_len] [-A]\n"
-                            "          [-C chan_freq[,chan_freq..]] [-r iq_file] [-D dump_file]\n"
+                            "          [-C chan_freq[,chan_freq..]] [-r iq_file] [-D dump_file] [-d dev]\n"
+                            "  -d selects the RTL-SDR: an index, or a case-insensitive substring of\n"
+                            "     the device's \"manufacturer product serial\" USB strings (default 0)\n"
                             "  -G enables the RTL2832 internal digital AGC\n"
                             "  -T enables the R820T analog tuner AGC (overrides -g)\n"
                             "  -W f_lo,f_hi[,dwell_s] sweeps the band in retuned chunks, running the full\n"
@@ -2510,19 +2589,8 @@ int main(int argc, char *argv[]) {
         if (f != stdin) fclose(f);
     } else {
         // ---- Live: RTL-SDR ----
-        rtlsdr_dev_t *dev = nullptr;
-        int dev_index = 0;
-
-        int n_devices = rtlsdr_get_device_count();
-        if (n_devices == 0) {
-            fprintf(stderr, "No RTL-SDR devices found\n");
-            finish_workers();
-            return 1;
-        }
-        fprintf(stderr, "Found %d RTL-SDR device(s)\n", n_devices);
-
-        if (rtlsdr_open(&dev, dev_index) < 0) {
-            fprintf(stderr, "Failed to open RTL-SDR device\n");
+        rtlsdr_dev_t *dev = open_rtl_device();
+        if (!dev) {
             finish_workers();
             return 1;
         }
