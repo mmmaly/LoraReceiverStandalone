@@ -2,7 +2,7 @@
 
 Standalone LoRa packet receiver in pure C/C++. No GNU Radio dependency.
 
-Connects directly to an RTL-SDR dongle (or replays a recorded IQ file) and implements the full LoRa PHY demodulation chain:
+Connects directly to an RTL-SDR dongle or a HackRF (or replays a recorded IQ file) and implements the full LoRa PHY demodulation chain:
 
 - Anti-alias low-pass FIR before decimation (~5 dB sensitivity gain at 4x oversampling)
 - Preamble detection with CFO/STO estimation (Bernier + RCTSL algorithms)
@@ -68,6 +68,8 @@ make check      # builds the offline frame generator and runs end-to-end tests (
 | `-X <1-3>` | **Offline deep parameter search** (needs `-r`): when a frame fails CRC after the normal recovery ladder, re-decode the whole retained frame over a grid of CFO / sub-chip timing / SFO hypotheses, accepting on CRC. The live estimates come from ~4 preamble symbols at whatever SNR the frame arrived with; the payload's 50-200 symbols say far more about the true values. Level 1 is fast and narrow, 3 is exhaustive (past ±1 CFO bin, ±1 chip of timing, 5 SFO scalings). Most hypotheses die after 8 symbols on the re-parsed header, so it costs ~3x a plain replay. | off |
 | `-M <n>` | Max decoders running at once in `-W` mode. Decoding is cheap (24 decoders at 2 MS/s measured 6.6x real-time on an 8-core laptop) while each extra batch multiplies a chunk's wall time by another dwell, so the default runs wide. Sets larger than this are split into sequential dwells at the same tuner position. A sweep warns if it keeps <95% of samples. | 4x cores |
 | `-r <file>` | Replay IQ from file (rtl_sdr u8 format, `-` = stdin) instead of SDR; a `.C16` file is read as PortaPack/Mayhem int16 IQ, with tuner freq and sample rate defaulted from its `.TXT` sidecar | — |
+| `-d <n\|substr>` | Select the RTL-SDR when several are plugged in: a device index, or a case-insensitive substring of the device's "manufacturer product serial" USB strings (e.g. `-d 'Blog V4'`, `-d UHIDIR`) — cheap sticks all ship with serial 00000001, so the product name is usually the only distinguisher. Ambiguous or non-matching selectors fail with the device list printed. | 0 |
+| `-H <lna[,vga[,amp]]>` | Receive from a HackRF instead of an RTL-SDR (needs libhackrf at build time): LNA gain 0–40 dB, VGA gain 0–62 dB, RF amp 0/1. Sample rates below the HackRF's specified 2 MS/s minimum are auto-raised (or refused with explicit `-s`); `-p` is folded into the hardware tune frequency since libhackrf has no correction knob. In an urban 868 MHz band leave the amp **off**: measured here, `amp=1` overloaded the unfiltered front end and cost ~6 dB SNR and 4/5 of decoded packets. | 40,40,0 |
 | `-D <file>` | In `-W` mode this becomes a prefix: one file per tuner position (`<file>-<tuner_hz>.iq`), each with a printed ready-to-run replay command - a single file spanning retunes has no well-defined centre frequency and cannot be replayed. Otherwise: Dump raw IQ to file while receiving (replay later with `-r`) | — |
 
 ### Examples
@@ -156,6 +158,22 @@ Side-by-side test against a Seeed Wio (SX1262) on the same antenna position, 565
 - Net result: the RTL-SDR runs **roughly 4–5 dB behind a dedicated LoRa chip** — consistent with its ~6 dB noise figure plus 8-bit quantization against the SX1262's ~2–3 dB. An antenna-side SAW-filtered LNA would close most of that gap.
 - Receiver occupancy (busy decoding one frame when another arrives) costs only ~1% at this traffic level — sensitivity, not architecture, is the limit.
 
+### Between receivers
+
+Three receivers on one host decoding the same live MeshCore traffic for 96 minutes (1663 distinct transmissions, matched between logs by payload + timestamp):
+
+| Receiver | Sensitivity vs Blog V4 | Share of all transmissions decoded |
+|---|---|---|
+| RTL-SDR Blog V4, `-G -T` | reference | 77% |
+| HackRF One, `-H 40,40,0` (**identical antenna**) | **−0.9 dB** | 58% |
+| Generic RTL2838UHIDIR, `-p 70` (worse antenna) | **−1.9 dB** | 62% |
+
+Method note worth keeping: bucketing the paired SNR deltas by the *reference* receiver's own SNR makes the penalty appear to grow without bound (−2 dB overall, −4.7 dB above 0 dB, −6.5 dB above +6 dB). That is regression to the mean — conditioning on a noisy estimate selects that receiver's favourable noise draws. With three receivers the fix is to condition on the **third** receiver, whose noise is independent of the two being compared; the figures above then hold steady across every threshold, and the three pairwise deltas agree (V4→HackRF −0.9, V4→UHIDIR −1.9, and HackRF−UHIDIR measured +1.0).
+
+Misses are signal-driven rather than random loss: every receiver decodes far more of the transmissions the other two both heard (86%/66%/65%) than of those only one other heard (64%/49%/44%).
+
+Combined with the SX1262 comparison above, the HackRF lands roughly **5–6 dB** behind a dedicated LoRa chip. Its RF amp must stay **off** in this band — enabling it overloaded the unfiltered front end and cost ~6 dB SNR and 4/5 of decoded packets; raising the VGA past 40 dB gained nothing.
+
 Offline, `-X` adds a deep parameter search on frames that still fail (see the option table). It is worth about **+1 packet per 100** on clean captures - small, but every recovery so far has verified as genuine MeshCore traffic, including an Advert with a valid Ed25519 signature (which cannot pass by chance). The interesting part is *why* they failed: one needed a 1-sample timing shift (finer than any earlier stage searched), one needed the SFO drift correction disabled, one needed -0.75 CFO bins. Those are estimator errors, not noise - which is why more CPU can fix them and a better antenna cannot.
 
 The soft-decision demod and the CRC-guided recovery ladder (amplitude LLRs, rotation/nibble/symbol chase) are worth ~+20% decoded packets on real captures versus the plain pipeline; the chase marks recoveries that multiple error patterns could explain as `AMBIGUOUS` on stderr rather than presenting a coin-flip payload as certain.
@@ -169,7 +187,52 @@ The soft-decision demod and the CRC-guided recovery ladder (amplitude LLRs, rota
 ./lora_rx -r test.iq -A          # decodes it, reports [SF9/125k]
 ```
 
-Options: `-N <sigma>` additive noise, `-O <hz>` carrier frequency offset, `-a <amp>` amplitude, `-w <hex>` sync word. `./run_tests.sh` (or `make check`) runs an end-to-end suite covering SF7-SF12, LDRO, CFO, noise, auto-scan, and sync-word detection.
+Options: `-N <sigma>` additive noise, `-O <hz>` carrier frequency offset, `-a <amp>` amplitude, `-w <hex>` sync word. `./run_tests.sh` (or `make check`) runs an end-to-end suite covering SF7-SF12, LDRO, CFO, noise, auto-scan, sync-word detection, and the transmitter's own loopback.
+
+## Transmitting (`lora_tx`)
+
+`lora_tx` is the counterpart to `lora_rx`: the same PHY option letters (`-f -s -b -S -c -w -p`), the same encoder as `lora_tx_gen` (shared in `lora_frame.h`), transmitted over a **HackRF**.
+
+```bash
+./lora_tx -f 869618000 -S 7 -b 62500 -m "HELLO MESH"      # one text packet
+./lora_tx -f 869618000 -S 7 -x 2e0092293a8d               # one hex packet
+./lora_tx -f 869618000 -S 7 -r packets.txt -n 3           # a list, three passes
+grep "rx ok" obe-pakety.txt | ./lora_tx -f 869618000 -S 7 -r -   # replay a capture
+./lora_tx -S 7 -m "TEST" -o out.iq && ./lora_rx -r out.iq -S 7 -b 62500 -s 2000000
+```
+
+The packet file is one packet per line, and deliberately accepts `lora_rx`'s own output so a capture log replays on air without editing:
+
+```
+# comment lines and blank lines are ignored
+rx ok: 2e0092293a8dc83dee23a8a01e415cc15d    a line copied from lora_rx
+aa:bb:cc:dd ee ff                            hex, separators optional
+@2.5                                         wait 2.5 s before the next packet
+```
+
+With `-t` each line is sent as literal text instead of hex.
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-m <text>` / `-x <hex>` | One packet from the command line (repeatable) | — |
+| `-r <file>` | Packet list, `-` = stdin | — |
+| `-t` | Input lines are text, not hex | off |
+| `-n <count>` | Repeat the whole list; `0` = until interrupted | 1 |
+| `-G <sec>` | Gap between packets | 1.0 |
+| `-y <pct>` | **Duty cycle cap**: idle after each frame so on-air time stays under this share of the channel. `0` disables it. | 1.0 |
+| `-g <0-47>` | HackRF TX VGA gain (dB) | 20 |
+| `-a` | Enable the HackRF RF amp (+11 dB) | off |
+| `-L <0-1>` | Digital amplitude; 1.0 risks DAC clipping | 0.7 |
+| `-O <hz>` | Transmit offset from the LO so its leakage falls outside the channel; `0` puts the LO on the channel | samp_rate/4 |
+| `-o <file>` | Write baseband IQ instead of transmitting (decode with `lora_rx -r`) | — |
+| `-N` | Dry run: encode, report airtime, transmit nothing | off |
+
+Verified on air: HackRF transmitting, RTL-SDR receiving, text and hex payloads round-tripping byte-exact down to −10 dB SNR. Two lessons from that bring-up, both invisible to the file loopback:
+
+- **Levels matter more than you would expect at close range.** With the receiver on AGC (`-G -T`) a transmitter a few centimetres away drove 30% of the ADC samples into the rails; a clipped LoRa chirp still syncs and still yields a *valid header*, so the failure looks like a decoder bug rather than overload. The AGC sets gain from wideband average power between bursts, then the burst clips. Use a manual receive gain for close-range tests.
+- **A transmit call returning is not the same as the signal having been radiated.** See the drain comment in `lora_tx.cpp`: libhackrf keeps ~0.26 s of samples queued at 2 MS/s, so stopping when the callback runs dry truncates the frame's tail. The symptom was a perfectly decoded header followed by noise where the payload should be, at every gain and every SNR.
+
+**Transmitting is regulated.** The EU 868 MHz ISM band limits how long a device may occupy a channel, so `lora_tx` enforces a duty cycle by idling after each frame (default 1%, the conservative sub-band figure — 869.4–869.65 MHz permits 10%) and never leaves the PA keyed between frames. A SF12/62.5 kHz frame is 2.3 s of airtime, which at 1% means ~4 minutes of silence after it; `-N` reports the numbers before anything is radiated. Check what your license and local regulations allow before raising `-y`, `-g`, or `-a`.
 
 ## License
 

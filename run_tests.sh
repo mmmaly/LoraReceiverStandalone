@@ -75,6 +75,41 @@ else
     FAIL=1
 fi
 
+# ---- lora_tx (transmitter) ----
+# Same encoder as lora_tx_gen, driven through the transmitter's own input
+# parsing: a hex line, a "rx ok:" line copied from lora_rx, and a text line.
+# -o writes the baseband it would have sent, so the loopback needs no radio.
+tx_case() {
+    local desc="$1" txargs="$2" rxargs="$3" expect_hex="$4"
+    eval "./lora_tx -o '$TMP/tx.iq' -G 0.02 $txargs" >/dev/null 2>&1
+    local out
+    out=$(eval "./lora_rx -r '$TMP/tx.iq' $rxargs" 2>/dev/null || true)
+    if echo "$out" | grep -qF "rx ok: $expect_hex"; then
+        echo "PASS: lora_tx $desc"
+    else
+        echo "FAIL: lora_tx $desc"
+        echo "$out" | sed 's/^/    /'
+        FAIL=1
+    fi
+}
+
+tx_case "text payload (-m)" "-S 7 -b 62500 -s 250000 -m 'TX HELLO'" \
+        "-S 7 -b 62500 -s 250000" "$(printf 'TX HELLO' | od -An -tx1 | tr -d ' \n')"
+tx_case "hex payload (-x)" "-S 8 -b 62500 -s 250000 -c 2 -x 2e0092293a8dc83d" \
+        "-S 8 -b 62500 -s 250000" "2e0092293a8dc83d"
+
+# The transmitter must accept lora_rx's own log lines, so a capture replays
+printf '# comment\nrx ok: aabbccddeeff\n@0.1\n0102030405\n' > "$TMP/pkts.txt"
+out=$(./lora_tx -o "$TMP/tx2.iq" -G 0.02 -S 7 -b 62500 -s 250000 -r "$TMP/pkts.txt" >/dev/null 2>&1 && \
+      ./lora_rx -r "$TMP/tx2.iq" -S 7 -b 62500 -s 250000 2>/dev/null || true)
+if echo "$out" | grep -qF "rx ok: aabbccddeeff" && echo "$out" | grep -qF "rx ok: 0102030405"; then
+    echo "PASS: lora_tx packet file (rx-ok replay + hex + comments)"
+else
+    echo "FAIL: lora_tx packet file (rx-ok replay + hex + comments)"
+    echo "$out" | sed 's/^/    /'
+    FAIL=1
+fi
+
 # ---- lora_lite (embedded core, used by the PortaPack/Mayhem app) ----
 # Same synthesized frames, decoded by the no-malloc/no-thread static-buffer core.
 if command -v c++ >/dev/null 2>&1; then
