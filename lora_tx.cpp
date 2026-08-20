@@ -140,14 +140,17 @@ int main(int argc, char *argv[]) {
     bool amp = false;
     double level = 0.7;
     double gap = 1.0, duty = 1.0;
-    double offset_hz = -1.0;         // <0 = auto (samp_rate/4)
+    double offset_hz = 0.0;
+    // -P raises the whole chain to maximum, but only for the knobs the user
+    // did not set by hand, so an explicit -g/-L still wins whatever the order
+    bool vga_set = false, level_set = false, offset_set = false, max_power = false;
     long repeats = 1;
     bool as_text = false, dry_run = false;
     const char *pkt_file = nullptr, *out_path = nullptr;
     std::vector<TxItem> items;
 
     int opt;
-    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:p:g:aL:m:x:r:tn:G:y:O:o:N")) != -1) {
+    while ((opt = getopt(argc, argv, "f:s:b:S:c:w:p:g:aL:m:x:r:tn:G:y:O:o:NP")) != -1) {
         switch (opt) {
         case 'f': freq = (uint32_t)atol(optarg); break;
         case 's': samp_rate = (uint32_t)atol(optarg); break;
@@ -156,9 +159,10 @@ int main(int argc, char *argv[]) {
         case 'c': cr = atoi(optarg); break;
         case 'w': sync_word = (uint16_t)strtol(optarg, nullptr, 16); break;
         case 'p': ppm = atoi(optarg); break;
-        case 'g': vga = atol(optarg); break;
+        case 'g': vga = atol(optarg); vga_set = true; break;
         case 'a': amp = true; break;
-        case 'L': level = atof(optarg); break;
+        case 'L': level = atof(optarg); level_set = true; break;
+        case 'P': max_power = true; break;
         case 'm': {
             TxItem it;
             it.payload.assign(optarg, optarg + strlen(optarg));
@@ -176,14 +180,14 @@ int main(int argc, char *argv[]) {
         case 'n': repeats = atol(optarg); break;
         case 'G': gap = atof(optarg); break;
         case 'y': duty = atof(optarg); break;
-        case 'O': offset_hz = atof(optarg); break;
+        case 'O': offset_hz = atof(optarg); offset_set = true; break;
         case 'o': out_path = optarg; break;
         case 'N': dry_run = true; break;
         default:
             fprintf(stderr,
                 "Usage: %s [-f freq] [-s samp_rate] [-b bw] [-S sf] [-c cr] [-w sync_hex] [-p ppm]\n"
                 "          [-m text | -x hex | -r pktfile] [-t] [-n repeats] [-G gap_s] [-y duty_pct]\n"
-                "          [-g tx_vga_db] [-a] [-L level] [-O offset_hz] [-o file.iq] [-N]\n"
+                "          [-g tx_vga_db] [-a] [-P] [-L level] [-O offset_hz] [-o file.iq] [-N]\n"
                 "  PHY options match lora_rx: -f -s -b -S -c -w -p\n"
                 "  -m <text>   send this text as one packet (repeatable)\n"
                 "  -x <hex>    send this hex payload as one packet (repeatable)\n"
@@ -197,9 +201,16 @@ int main(int argc, char *argv[]) {
                 "              sub-band limit; 869.4-869.65 MHz allows 10; 0 disables the cap)\n"
                 "  -g <0-47>   HackRF TX VGA gain in dB (default 20)\n"
                 "  -a          enable the HackRF RF amp (+11 dB) - off by default\n"
-                "  -L <0-1>    digital amplitude (default 0.7; 1.0 risks DAC clipping)\n"
+                "  -P          maximum power: -g 47 -a -L 1.0, for whichever of those you did\n"
+                "              not set yourself. LoRa is constant-envelope, so driving the\n"
+                "              chain into compression costs no signal quality - but it does\n"
+                "              raise harmonics and spurs, which are separately regulated.\n"
+                "  -L <0-1>    digital amplitude (default 0.7). A LoRa chirp has 0 dB PAPR, so\n"
+                "              1.0 is the full DAC scale without clipping and is worth +3.1 dB\n"
                 "  -O <hz>     transmit offset from the LO so its leakage lands outside the\n"
-                "              channel (default samp_rate/4; 0 tunes the LO onto the channel)\n"
+                "              channel (default 2x bw, min 100 kHz, capped at samp_rate/4;\n"
+                "              0 tunes the LO onto the channel). Larger offsets cost signal\n"
+                "              to the DAC sinc roll-off, so this stays no wider than it must\n"
                 "  -o <file>   write baseband IQ (rtl_sdr u8) instead of transmitting; decode it\n"
                 "              back with lora_rx -r <file>. No LO offset is applied.\n"
                 "  -N          dry run: encode and report airtime, transmit nothing\n", argv[0]);
@@ -228,7 +239,22 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "HackRF minimum sample rate is 2000000 (use -o for a lower-rate file)\n");
         return 1;
     }
-    if (offset_hz < 0) offset_hz = samp_rate / 4.0;
+    if (max_power) {
+        if (!vga_set) vga = 47;
+        if (!level_set) level = 1.0;
+        amp = true;
+    }
+    // The offset only has to clear the receiver's channel filter, and every Hz
+    // of it costs signal: the DAC's zero-order hold rolls off as sinc(f/fs) and
+    // the baseband filter adds its own skirt. The old samp_rate/4 default threw
+    // away 0.9 dB at 2 MS/s to move the LO spur 8x further out than it needed
+    // to be. Two channel widths is ample, capped at the old value so a wide bw
+    // at a low sample rate is no worse off than before.
+    if (!offset_set) {
+        offset_hz = 2.0 * bw;
+        if (offset_hz < 100000.0) offset_hz = 100000.0;
+        if (offset_hz > samp_rate / 4.0) offset_hz = samp_rate / 4.0;
+    }
     if (fabs(offset_hz) > 0.45 * samp_rate) {
         fprintf(stderr, "-O %.0f Hz is outside the usable span at samp_rate %u\n", offset_hz, samp_rate);
         return 1;
@@ -268,6 +294,20 @@ int main(int argc, char *argv[]) {
     else
         fprintf(stderr, "duty cycle cap disabled (-y 0): only the %.2f s gap paces transmission\n", gap);
 
+    if (!out_path) {
+        double sinc_db = 0.0;
+        if (offset_hz != 0.0) {
+            double x = M_PI * offset_hz / samp_rate;
+            sinc_db = 20.0 * log10(fabs(sin(x) / x));
+        }
+        fprintf(stderr, "VGA %ld dB, amp %s, level %.2f (%+.1f dBFS), LO offset %+.0f Hz (%.2f dB sinc loss)\n",
+                vga, amp ? "ON" : "off", level, 20.0 * log10(level), offset_hz, sinc_db);
+        if (max_power)
+            fprintf(stderr, "-P: chain at maximum. LoRa is constant-envelope so compression costs no\n"
+                            "    signal quality, but harmonics and spurious emissions are limited\n"
+                            "    separately from output power - filter the output if you mean it.\n");
+    }
+
     // ---- File output: plain baseband, decodable with lora_rx -r ----
     if (out_path) {
         FILE *f = fopen(out_path, "wb");
@@ -304,13 +344,29 @@ int main(int argc, char *argv[]) {
     return 1;
 #else
     // ---- Quantize to the HackRF's signed 8-bit IQ, at the LO offset ----
+    // The frame steps from silence to full amplitude in one sample. That edge
+    // rings in the HackRF's analog reconstruction filter -- tolerable at -L 0.7,
+    // but at full scale the overshoot clips, and either way the step splatters
+    // energy into the neighbouring channels. A 20 us raised-cosine ramp on each
+    // end removes both, at the cost of 1% of one of the eight preamble symbols.
+    // The -o file output keeps its hard edges: the ringing is a property of the
+    // radio, not of the waveform, and the tests decode that file byte-exact.
+    const size_t ramp = samp_rate / 50000;
+
     std::vector<std::vector<int8_t>> tx(items.size());
     for (size_t i = 0; i < items.size(); i++) {
         if (items[i].delay > 0.0) continue;
         tx[i].resize(frames[i].size() * 2);
+        const size_t r0 = fp.pre_silence;                        // first live sample
+        const size_t r1 = frames[i].size() - fp.tail_silence;    // one past the last
         double ph = 0.0, ph_inc = 2.0 * M_PI * offset_hz / (double)samp_rate;
         for (size_t n = 0; n < frames[i].size(); n++) {
             cx z = frames[i][n] * (float)level;
+            if (ramp && n >= r0 && n < r1) {
+                size_t into = n - r0, from_end = r1 - 1 - n;
+                size_t k = into < from_end ? into : from_end;
+                if (k < ramp) z *= (float)(0.5 - 0.5 * cos(M_PI * (k + 0.5) / ramp));
+            }
             if (offset_hz != 0.0) {
                 z *= cx((float)cos(ph), (float)sin(ph));
                 ph += ph_inc;
@@ -343,8 +399,7 @@ int main(int argc, char *argv[]) {
     hackrf_set_txvga_gain(dev, (uint32_t)vga);
     hackrf_set_amp_enable(dev, amp ? 1 : 0);
 
-    fprintf(stderr, "HackRF TX on %.6f MHz (LO %.6f MHz %+.0f Hz offset), VGA %ld dB, amp %s\n",
-            freq / 1e6, tune / 1e6, offset_hz, vga, amp ? "ON" : "off");
+    fprintf(stderr, "HackRF TX on %.6f MHz (LO %.6f MHz)\n", freq / 1e6, tune / 1e6);
 
     long sent = 0;
     for (long pass = 0; g_running && (repeats == 0 || pass < repeats); pass++) {
@@ -361,6 +416,11 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "hackrf_start_tx failed\n");
                 break;
             }
+            // start_tx flips the transceiver mode, which reconfigures the RF
+            // path. The gain and amp settings are meant to survive that; a
+            // control transfer per frame is cheap enough not to depend on it.
+            hackrf_set_txvga_gain(dev, (uint32_t)vga);
+            hackrf_set_amp_enable(dev, amp ? 1 : 0);
             while (g_running && st.pos < st.len) usleep(2000);
             // The callback handing over the last sample only means libhackrf
             // has it, not that it has been radiated: a full USB transfer queue
